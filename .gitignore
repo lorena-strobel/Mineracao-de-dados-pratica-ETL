@@ -1,0 +1,4 @@
+dados/
+saida/
+__pycache__/
+*.pyc

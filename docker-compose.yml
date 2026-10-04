@@ -1,0 +1,115 @@
+name: lab-etl-varejo
+
+services:
+
+  # ---------------------------------------------------------------- origem 1
+  mysql_legado:
+    image: mysql:8.0
+    container_name: lab_mysql_legado
+    command: >
+      --local-infile=1
+      --character-set-server=latin1
+      --collation-server=latin1_swedish_ci
+      --secure-file-priv=
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: loja_legado
+    ports:
+      - "3307:3306"
+    volumes:
+      - vol_mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ---------------------------------------------------------------- origem 2
+  pg_ecommerce:
+    image: postgres:16
+    container_name: lab_pg_ecommerce
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - vol_pg_ecom:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ------------------------------------------------------------------ destino
+  pg_dw:
+    image: postgres:16
+    container_name: lab_pg_dw
+    environment:
+      POSTGRES_DB: mercatto_dw
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - vol_pg_dw:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mercatto_dw"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # -------------------------------------------------------- inspeção via web
+  adminer:
+    image: adminer:4
+    container_name: lab_adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql_legado
+      - pg_ecommerce
+      - pg_dw
+
+  # ------------------------------ geração e carga inicial (executa uma vez)
+  seed:
+    build: ./gerador
+    container_name: lab_seed
+    environment:
+      DIR_DADOS: /dados
+      DIR_SQL: /sql
+      ESCALA: "${ESCALA:-1.0}"
+      MYSQL_HOST: mysql_legado
+      PG_ORIGEM_DSN: "host=pg_ecommerce port=5432 dbname=ecommerce user=postgres password=postgres"
+      PG_DW_DSN: "host=pg_dw port=5432 dbname=mercatto_dw user=postgres password=postgres"
+    volumes:
+      - ./dados:/dados
+      - ./sql:/sql:ro
+    depends_on:
+      mysql_legado: { condition: service_healthy }
+      pg_ecommerce: { condition: service_healthy }
+      pg_dw:        { condition: service_healthy }
+    restart: "no"
+
+  # ------------------------------------------- ambiente de trabalho do aluno
+  etl:
+    build: ./etl
+    container_name: lab_etl
+    environment:
+      DIR_DADOS: /dados
+      MYSQL_DSN: "mysql+pymysql://etl_ro:etl_ro@mysql_legado:3306/loja_legado?charset=latin1"
+      PG_ORIGEM_DSN: "postgresql+psycopg2://etl_ro:etl_ro@pg_ecommerce:5432/ecommerce"
+      PG_DW_DSN: "postgresql+psycopg2://postgres:postgres@pg_dw:5432/mercatto_dw"
+    volumes:
+      - ./dados:/dados
+      - ./etl:/etl
+      - ./saida:/saida
+    working_dir: /etl
+    depends_on:
+      seed: { condition: service_completed_successfully }
+    command: ["sleep", "infinity"]
+
+volumes:
+  vol_mysql:
+  vol_pg_ecom:
+  vol_pg_dw:
