@@ -57,6 +57,6 @@ CREATE INDEX IX_PEDIDOS_DATA    ON PEDIDOS (DT_PEDIDO);
 CREATE INDEX IX_ITENS_PEDIDO    ON ITENS_PEDIDO (ID_PEDIDO);
 
 -- Usuário somente-leitura para o pipeline dos estudantes.
-CREATE USER IF NOT EXISTS 'etl_ro'@'%' IDENTIFIED BY 'etl_ro';
+CREATE USER IF NOT EXISTS 'etl_ro'@'%' IDENTIFIED WITH mysql_native_password BY 'etl_ro';
 GRANT SELECT ON loja_legado.* TO 'etl_ro'@'%';
 FLUSH PRIVILEGES;
