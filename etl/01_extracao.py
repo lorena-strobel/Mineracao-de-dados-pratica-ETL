@@ -41,6 +41,7 @@ def grava_stg(df, tabela, engine, primeiro_bloco):
 
 
 def extrai_mysql(qa):
+    print("-> Extraindo MySQL...", flush=True)
     eng, dw = eng_mysql(), eng_dw()
     # TODO 1.1 — para cada tabela do legado, leia em blocos de LOTE linhas
     #            e grave em stg.legado_<tabela>.
@@ -58,6 +59,7 @@ def extrai_mysql(qa):
 
 
 def extrai_postgres(qa):
+    print("-> Extraindo PostgreSQL E-commerce...", flush=True)
     # TODO 1.2 — mesma ideia para shop.customer / product / orders / order_item.
     #            Atenção: placed_at e delivered_at são TIMESTAMPTZ.
     #            Em qual fuso você vai padronizar? Registre a decisão.
@@ -77,6 +79,7 @@ def extrai_postgres(qa):
 
 
 def extrai_sac(qa):
+    print("-> Extraindo CSV do SAC...", flush=True)
     # TODO 1.3 — leia o CSV do SAC.
     #   · encoding e separador: descubra no perfilamento, não chute;
     #   · leia TUDO como texto (dtype=str) — conversão é transformação;
@@ -91,6 +94,7 @@ def extrai_sac(qa):
 
 
 def extrai_avaliacoes(qa):
+    print("-> Extraindo NDJSON de Avaliações...", flush=True)
     # TODO 1.4 — leia o NDJSON.
     #   · o esquema é irregular: chaves faltando NÃO são o mesmo que nulas;
     #   · preserve o aninhamento em colunas explícitas (order_ref, product_sku);
@@ -104,6 +108,11 @@ def extrai_avaliacoes(qa):
         chunk['product_sku'] = chunk['product'].apply(lambda x: x.get('sku') if isinstance(x, dict) else None)
         
         chunk['rating'] = chunk['rating'].apply(lambda x: str(x) if pd.notna(x) else None)
+
+        if 'order' in chunk.columns:
+            chunk = chunk.drop(columns=['order'])
+        if 'product' in chunk.columns:
+            chunk = chunk.drop(columns=['product'])
 
         grava_stg(chunk, "marketplace_avaliacoes", dw, primeiro_bloco)
         primeiro_bloco = False
@@ -125,17 +134,18 @@ if __name__ == "__main__":
     # A contagem esperada vem de um SELECT COUNT(*) na própria origem:
     # extração que perde linha silenciosamente é o defeito mais caro do pipeline.
 
-    # 1. qa.igual para testar o MySQL
     with eng_mysql().connect() as conn:
-        esp_mysql = conn.execute(text("SELECT COUNT(*) FROM PEDIDOS")).scalar()
+        esp_mysql = int(conn.execute(text("SELECT COUNT(*) FROM PEDIDOS")).scalar())
     df_mysql_stg = pd.read_sql("SELECT COUNT(*) as qtd FROM stg.legado_pedidos", dw)
-    qa.igual("linhas legado.PEDIDOS", df_mysql_stg['qtd'].iloc[0], esp_mysql, "Pedidos do MySQL divergente")
+    val_mysql = int(df_mysql_stg['qtd'].iloc[0])
+    qa.igual("linhas legado.PEDIDOS", val_mysql, esp_mysql, "Pedidos do MySQL divergente")
 
     # 2. qa.igual para testar o Postgres
     with eng_origem().connect() as conn:
-        esp_pg = conn.execute(text("SELECT COUNT(*) FROM shop.orders")).scalar()
+        esp_pg = int(conn.execute(text("SELECT COUNT(*) FROM shop.orders")).scalar())
     df_pg_stg = pd.read_sql("SELECT COUNT(*) as qtd FROM stg.ecommerce_orders", dw)
-    qa.igual("linhas ecommerce.orders", df_pg_stg['qtd'].iloc[0], esp_pg, "Orders do Postgres divergente")
+    val_pg = int(df_pg_stg['qtd'].iloc[0])
+    qa.igual("linhas ecommerce.orders", val_pg, esp_pg, "Orders do Postgres divergente")
 
     # 3. qa.sem_nulos para o SAC
     df_sac_stg = pd.read_sql("SELECT protocolo FROM stg.sac_atendimentos", dw)
