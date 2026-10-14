@@ -74,8 +74,78 @@ def unifica_clientes(qa):
     Preencha dim_cliente com o rastro: id_legado, id_ecommerce,
     origem_unificacao e regra_pareamento (que regra uniu cada par).
     """
-    # TODO 2.1
-    raise NotImplementedError
+    print("-> Unifica Clientes...", flush=True)
+    dw = eng_dw()
+    clientes_legado = pd.read_sql("SELECT * FROM stg.legado_clientes", dw)
+    clientes_ecom= pd.read_sql("SELECT * FROM stg.ecommerce_customer", dw)
+
+    clientes_legado.columns = [c.lower() for c in clientes_legado.columns]
+    clientes_ecom.columns = [c.lower() for c in clientes_ecom.columns]
+
+    # Tratamento de CPF e dos nomes dos clientes do legado e do ecommerce
+    clientes_legado["cpf_limpo"] = clientes_legado["cpf"].apply(so_digitos)
+    clientes_legado["cpf_valido"] = clientes_legado["cpf_limpo"].apply(cpf_valido)
+    clientes_legado["nome_normalizado"] = clientes_legado["nome"].apply(normaliza_nome)
+    
+    clientes_ecom["cpf_limpo"] = clientes_ecom["tax_id"].apply(so_digitos)
+    clientes_ecom["cpf_valido"] = clientes_ecom["cpf_limpo"].apply(cpf_valido)
+    clientes_ecom["nome_normalizado"] = clientes_ecom["full_name"].apply(normaliza_nome)
+
+    # Tratamento das duplicatas internas do legado 
+    # Ordenamento pela data mais RECENTE para a mais ANTIGA
+    clientes_legado = clientes_legado.sort_values(by="dt_cadastro", ascending=False)
+    duplicatas_legado = clientes_legado.duplicated(subset=["cpf_limpo"]).sum()
+
+    # uso do cadastro mais recente
+    legado_validos = clientes_legado[clientes_legado["cpf_valido"] == True].drop_duplicates(subset=["cpf_limpo"], keep="first")
+
+    clientes_ecom = clientes_ecom.sort_values(by="created_at", ascending=False)
+    ecom_validos = clientes_ecom[clientes_ecom["cpf_valido"]==True].drop_duplicates(subset=["cpf_limpo"], keep="first")
+
+    # legado e ecommerce mergeado garantindo que mesmo que exista em somente uma das tabelas também ocorra o merge
+    cruzamento = pd.merge(legado_validos, ecom_validos, 
+            on="cpf_limpo", how="outer", suffixes=('_leg','_ecom')
+    )
+
+    # origem da unificação 
+    def define_origem(row):
+        if pd.notna(row.get('id')) and pd.notna(row.get('customer_id')):
+            return 'AMBOS'
+        elif pd.notna(row.get('id')):
+            return 'LEGADO'
+        else:
+            return 'ECOM'
+    
+    cruzamento['origem_unificacao'] = cruzamento.apply(define_origem, axis=1)
+    cruzamento['regra_pareamento'] = 'CPF_VALIDO'
+
+    # montagem final com as colunas
+    dim_cliente = pd.DataFrame({
+        'id_legado': cruzamento.get('id'),
+        'id_ecommerce': cruzamento.get('customer_id'),
+        'cpf_normalizado': cruzamento['cpf_limpo'],
+        'origem_unificacao': cruzamento['origem_unificacao'],
+        'regra_pareamento': cruzamento['regra_pareamento']
+    })
+
+    dim_cliente.to_sql("dim_cliente", dw, schema="dw", if_exists="replace", index=False)
+
+    # Bloco para validar o resultado logo após a gravação
+    print("-> Verificando dados gravados em dw.dim_cliente...")
+    df_verificacao = pd.read_sql("SELECT * FROM dw.dim_cliente LIMIT 5", dw)
+    print(df_verificacao)
+
+    # Verificando quantos clientes caíram em cada categoria (AMBOS, LEGADO, ECOM)
+    df_resumo = pd.read_sql("""
+        SELECT origem_unificacao, regra_pareamento, COUNT(*) as total 
+        FROM dw.dim_cliente 
+        GROUP BY origem_unificacao, regra_pareamento
+    """, dw)
+    print("\nResumo da unificação:")
+    print(df_resumo)
+    print(f"-> Processo concluído:  {len(dim_cliente)} clientes unificados")
+    print(f"-> Duplicatas removidas no legado: {duplicatas_legado}")
+                                   
 
 
 # ===========================================================================
@@ -102,7 +172,8 @@ def conforma_status(qa):
     célula do mapeamento — esse número é parte da justificativa.
     """
     # TODO 2.2
-    raise NotImplementedError
+    raise NotImplementedErro
+
 
 
 # ===========================================================================
@@ -192,11 +263,11 @@ def liga_sac_e_avaliacoes(qa):
 if __name__ == "__main__":
     qa = Suite(etapa="02_transformacao")
     unifica_clientes(qa)
-    conforma_status(qa)
-    conforma_valores(qa)
-    conforma_categorias(qa)
-    trata_datas_e_ausencias(qa)
-    liga_sac_e_avaliacoes(qa)
+    # conforma_status(qa)
+    # conforma_valores(qa)
+    # conforma_categorias(qa)
+    # trata_datas_e_ausencias(qa)
+    # liga_sac_e_avaliacoes(qa)
 
     # TODO 2.7 — asserções obrigatórias desta etapa:
     #   · dim_cliente sem cpf_normalizado duplicado entre linhas com CPF válido;
