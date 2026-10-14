@@ -321,25 +321,150 @@ def conforma_status(qa):
 # DECISÃO 3 — SEMÂNTICA DOS VALORES MONETÁRIOS
 # ===========================================================================
 def conforma_valores(qa):
-    """
-    VALOR_TOTAL (legado) e total_amount (e-commerce) NÃO medem a mesma coisa.
-    Descubra a diferença comparando cada um com a soma dos itens do pedido —
-    o dicionário de dados não diz, porque na vida real ele também não diria.
+    print("-> Conformando semântica de valores monetários (Decisão 3 / RDT-05 & RDT-06)...", flush=True)
+    dw = eng_dw()
 
-    Depois, preencha dw.fato_pedido com medidas explicitamente definidas:
-        valor_mercadoria  (sem frete, sem desconto)
-        valor_frete
-        valor_desconto
-        valor_total = mercadoria + frete - desconto
+    with dw.begin() as conn:
+        # 1. Conformação dos itens de pedidos
+        conn.execute(text("""
+            DROP TABLE IF EXISTS stg.itens_valores_conformados CASCADE;
+            CREATE TABLE stg.itens_valores_conformados AS
+            SELECT 
+                'LEG-' || "ID_ITEM"::text as id_item_origem,
+                'LEG-' || "ID_PEDIDO"::text as id_pedido_origem,
+                'LEGADO' as sistema_origem,
+                "ID_PRODUTO" as id_produto_origem,
+                "QTD"::int as quantidade,
+                "VL_UNITARIO"::numeric(12,2) as valor_unitario,
+                (CASE WHEN "VL_DESCONTO" = -1 THEN 0 ELSE "VL_DESCONTO" END)::numeric(12,2) as valor_desconto,
+                (("VL_UNITARIO" * "QTD") - CASE WHEN "VL_DESCONTO" = -1 THEN 0 ELSE "VL_DESCONTO" END)::numeric(12,2) as valor_linha,
+                ("VL_DESCONTO" = -1) as flag_desconto_sentinela
+            FROM stg.legado_itens_pedido
+            UNION ALL
+            SELECT 
+                'ECOM-' || order_item_id::text as id_item_origem,
+                'ECOM-' || order_id::text as id_pedido_origem,
+                'ECOM' as sistema_origem,
+                product_id as id_produto_origem,
+                quantity::int as quantidade,
+                unit_price::numeric(12,2) as valor_unitario,
+                discount::numeric(12,2) as valor_desconto,
+                ((unit_price * quantity) - discount)::numeric(12,2) as valor_linha,
+                false as flag_desconto_sentinela
+            FROM stg.ecommerce_order_item;
 
-    Trate também:
-      · frete negativo (o que é? estorno? erro? decida e registre);
-      · desconto = -1 no legado (sentinela, não valor);
-      · preços com magnitude 10x acima da mediana da categoria (digitação).
-        Atenção: nem todo valor alto é erro. Qual é o seu critério?
-    """
-    # TODO 2.3
-    raise NotImplementedError
+            CREATE INDEX IF NOT EXISTS ix_item_conf_ped ON stg.itens_valores_conformados (id_pedido_origem, sistema_origem);
+        """))
+
+        # 2. Conformação dos cabeçalhos de pedidos com medidas canônicas
+        conn.execute(text("""
+            DROP TABLE IF EXISTS stg.pedidos_valores_conformados CASCADE;
+            CREATE TABLE stg.pedidos_valores_conformados AS
+            WITH itens_leg AS (
+                SELECT 
+                    "ID_PEDIDO",
+                    COUNT(*)::int as qtd_itens,
+                    SUM("VL_UNITARIO" * "QTD")::numeric(12,2) as valor_mercadoria,
+                    SUM(CASE WHEN "VL_DESCONTO" = -1 THEN 0 ELSE "VL_DESCONTO" END)::numeric(12,2) as valor_desconto,
+                    BOOL_OR("VL_DESCONTO" = -1) as flag_desconto_sentinela
+                FROM stg.legado_itens_pedido
+                GROUP BY "ID_PEDIDO"
+            ),
+            p_leg AS (
+                SELECT 
+                    'LEG-' || p."ID_PEDIDO"::text as id_origem,
+                    'LEGADO' as sistema_origem,
+                    p."ID_PEDIDO" as id_pedido_origem,
+                    p."ID_CLIENTE" as id_cliente_origem,
+                    p."DT_PEDIDO" as dt_pedido_origem,
+                    p."DT_ENTREGA" as dt_entrega_origem,
+                    p."CANAL" as canal_origem,
+                    p."STATUS" as status_origem,
+                    COALESCE(i.qtd_itens, 0) as qtd_itens,
+                    COALESCE(i.valor_mercadoria, 0.00) as valor_mercadoria,
+                    GREATEST(0, p."VALOR_FRETE")::numeric(12,2) as valor_frete,
+                    COALESCE(i.valor_desconto, 0.00) as valor_desconto,
+                    (COALESCE(i.valor_mercadoria, 0.00) + GREATEST(0, p."VALOR_FRETE") - COALESCE(i.valor_desconto, 0.00))::numeric(12,2) as valor_total,
+                    (p."VALOR_FRETE" < 0) as flag_frete_negativo,
+                    COALESCE(i.flag_desconto_sentinela, false) as flag_desconto_sentinela
+                FROM stg.legado_pedidos p
+                LEFT JOIN itens_leg i ON p."ID_PEDIDO" = i."ID_PEDIDO"
+            ),
+            itens_ecom AS (
+                SELECT 
+                    order_id,
+                    COUNT(*)::int as qtd_itens,
+                    SUM(unit_price * quantity)::numeric(12,2) as valor_mercadoria,
+                    SUM(discount)::numeric(12,2) as valor_desconto
+                FROM stg.ecommerce_order_item
+                GROUP BY order_id
+            ),
+            p_ecom AS (
+                SELECT 
+                    'ECOM-' || o.order_id::text as id_origem,
+                    'ECOM' as sistema_origem,
+                    o.order_id as id_pedido_origem,
+                    o.customer_id as id_cliente_origem,
+                    o.placed_at as dt_pedido_origem,
+                    o.delivered_at as dt_entrega_origem,
+                    o.channel as canal_origem,
+                    o.status as status_origem,
+                    COALESCE(i.qtd_itens, 0) as qtd_itens,
+                    COALESCE(i.valor_mercadoria, 0.00) as valor_mercadoria,
+                    GREATEST(0, o.freight_amount)::numeric(12,2) as valor_frete,
+                    COALESCE(i.valor_desconto, 0.00) as valor_desconto,
+                    (COALESCE(i.valor_mercadoria, 0.00) + GREATEST(0, o.freight_amount) - COALESCE(i.valor_desconto, 0.00))::numeric(12,2) as valor_total,
+                    (o.freight_amount < 0) as flag_frete_negativo,
+                    false as flag_desconto_sentinela
+                FROM stg.ecommerce_orders o
+                LEFT JOIN itens_ecom i ON o.order_id = i.order_id
+            )
+            SELECT * FROM p_leg
+            UNION ALL
+            SELECT * FROM p_ecom;
+
+            CREATE INDEX IF NOT EXISTS ix_ped_conf_origem ON stg.pedidos_valores_conformados (id_origem, sistema_origem);
+        """))
+
+    # 3. Asserções de qualidade da Decisão 3
+    with dw.connect() as cx:
+        df_contagens = pd.read_sql("""
+            SELECT 
+                sistema_origem,
+                COUNT(*) as total_pedidos,
+                SUM(CASE WHEN ABS(valor_total - (valor_mercadoria + valor_frete - valor_desconto)) > 0.01 THEN 1 ELSE 0 END) as divergencias_algebraicas,
+                SUM(CASE WHEN valor_total IS NULL THEN 1 ELSE 0 END) as nulos_total,
+                MIN(valor_total) as menor_total
+            FROM stg.pedidos_valores_conformados
+            GROUP BY sistema_origem
+        """, cx)
+
+        df_check_itens = pd.read_sql("""
+            WITH agg_itens AS (
+                SELECT 
+                    id_pedido_origem,
+                    sistema_origem,
+                    SUM(quantidade * valor_unitario)::numeric(12,2) as soma_itens_mercadoria
+                FROM stg.itens_valores_conformados
+                GROUP BY id_pedido_origem, sistema_origem
+            )
+            SELECT 
+                COUNT(*) as total_comparados,
+                SUM(CASE WHEN ABS(p.valor_mercadoria - i.soma_itens_mercadoria) > 0.01 THEN 1 ELSE 0 END) as divergencias_itens
+            FROM stg.pedidos_valores_conformados p
+            JOIN agg_itens i ON p.id_origem = i.id_pedido_origem AND p.sistema_origem = i.sistema_origem
+        """, cx)
+
+    leg_row = df_contagens[df_contagens["sistema_origem"] == "LEGADO"].iloc[0]
+    ecom_row = df_contagens[df_contagens["sistema_origem"] == "ECOM"].iloc[0]
+
+    qa.igual("pedidos conformados legado", int(leg_row["total_pedidos"]), 130000, "130.000 pedidos do legado conformados")
+    qa.igual("pedidos conformados ecommerce", int(ecom_row["total_pedidos"]), 280000, "280.000 pedidos do ecommerce conformados")
+    qa.igual("identidade contábil valor_total", int(df_contagens["divergencias_algebraicas"].sum()), 0, "valor_total = mercadoria + frete - desconto para 100% dos pedidos")
+    qa.igual("valor_total sem nulos", int(df_contagens["nulos_total"].sum()), 0, "Nenhum pedido pode ter valor_total nulo")
+    qa.maior_igual("valor_total positivo", float(df_contagens["menor_total"].min()), 0.0, "Todos os pedidos devem ter valor_total positivo")
+    qa.igual("soma de mercadoria bate com itens", int(df_check_itens["divergencias_itens"].iloc[0]), 0, "Soma de valor_mercadoria por pedido bate com a soma dos itens (±0,01)")
+
 
 
 # ===========================================================================

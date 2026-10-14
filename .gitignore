@@ -9,3 +9,7 @@ venv/
 env/
 
 scripts_aux/
+
+.agents/
+GEMINI.md
+CONTEXT.md
