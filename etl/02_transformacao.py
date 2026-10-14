@@ -426,7 +426,7 @@ def conforma_valores(qa):
             CREATE INDEX IF NOT EXISTS ix_ped_conf_origem ON stg.pedidos_valores_conformados (id_origem, sistema_origem);
         """))
 
-    # 3. Asserções de qualidade da Decisão 3
+    # 3. Asserções de qualidade da Decisão 3 (RDT-05 e RDT-06)
     with dw.connect() as cx:
         df_contagens = pd.read_sql("""
             SELECT 
@@ -455,15 +455,47 @@ def conforma_valores(qa):
             JOIN agg_itens i ON p.id_origem = i.id_pedido_origem AND p.sistema_origem = i.sistema_origem
         """, cx)
 
+        df_rdt06_pedidos = pd.read_sql("""
+            SELECT 
+                COUNT(*) as total_pedidos,
+                MIN(valor_frete) as menor_frete,
+                MIN(valor_desconto) as menor_desconto_pedido,
+                SUM(CASE WHEN flag_frete_negativo THEN 1 ELSE 0 END) as total_frete_negativo,
+                SUM(CASE WHEN sistema_origem = 'LEGADO' AND flag_frete_negativo THEN 1 ELSE 0 END) as frete_negativo_legado,
+                SUM(CASE WHEN sistema_origem = 'ECOM' AND flag_frete_negativo THEN 1 ELSE 0 END) as frete_negativo_ecom,
+                SUM(CASE WHEN flag_desconto_sentinela THEN 1 ELSE 0 END) as pedidos_com_sentinela
+            FROM stg.pedidos_valores_conformados
+        """, cx)
+
+        df_rdt06_itens = pd.read_sql("""
+            SELECT 
+                COUNT(*) as total_itens,
+                MIN(valor_desconto) as menor_desconto_item,
+                SUM(CASE WHEN valor_desconto = -1 THEN 1 ELSE 0 END) as itens_com_menos_um,
+                SUM(CASE WHEN flag_desconto_sentinela THEN 1 ELSE 0 END) as itens_flag_sentinela
+            FROM stg.itens_valores_conformados
+        """, cx)
+
     leg_row = df_contagens[df_contagens["sistema_origem"] == "LEGADO"].iloc[0]
     ecom_row = df_contagens[df_contagens["sistema_origem"] == "ECOM"].iloc[0]
 
+    # Asserções RDT-05 (Decomposição Canônica e Aditividade)
     qa.igual("pedidos conformados legado", int(leg_row["total_pedidos"]), 130000, "130.000 pedidos do legado conformados")
     qa.igual("pedidos conformados ecommerce", int(ecom_row["total_pedidos"]), 280000, "280.000 pedidos do ecommerce conformados")
     qa.igual("identidade contábil valor_total", int(df_contagens["divergencias_algebraicas"].sum()), 0, "valor_total = mercadoria + frete - desconto para 100% dos pedidos")
     qa.igual("valor_total sem nulos", int(df_contagens["nulos_total"].sum()), 0, "Nenhum pedido pode ter valor_total nulo")
     qa.maior_igual("valor_total positivo", float(df_contagens["menor_total"].min()), 0.0, "Todos os pedidos devem ter valor_total positivo")
     qa.igual("soma de mercadoria bate com itens", int(df_check_itens["divergencias_itens"].iloc[0]), 0, "Soma de valor_mercadoria por pedido bate com a soma dos itens (±0,01)")
+
+    # Asserções RDT-06 (Frete Negativo e Desconto Sentinela -1)
+    qa.maior_igual("frete não negativo dw", float(df_rdt06_pedidos["menor_frete"].iloc[0]), 0.0, "Nenhum pedido no DW pode conter frete negativo")
+    qa.maior_igual("desconto não negativo itens", float(df_rdt06_itens["menor_desconto_item"].iloc[0]), 0.0, "Nenhum item no DW pode conter desconto negativo")
+    qa.igual("desconto sem sentinela menos um", int(df_rdt06_itens["itens_com_menos_um"].iloc[0]), 0, "Nenhum item pode conter o sentinela -1 como desconto")
+    qa.igual("quantificacao frete negativo consolidado", int(df_rdt06_pedidos["total_frete_negativo"].iloc[0]), 1174, "Exatamente 1.174 pedidos com frete negativo truncado para 0.00")
+    qa.igual("quantificacao frete negativo legado", int(df_rdt06_pedidos["frete_negativo_legado"].iloc[0]), 362, "Exatamente 362 pedidos do legado com frete negativo")
+    qa.igual("quantificacao frete negativo ecom", int(df_rdt06_pedidos["frete_negativo_ecom"].iloc[0]), 812, "Exatamente 812 pedidos do e-commerce com frete negativo")
+    qa.igual("quantificacao desconto sentinela itens", int(df_rdt06_itens["itens_flag_sentinela"].iloc[0]), 4056, "Exatamente 4.056 itens do legado marcados com flag_desconto_sentinela")
+    qa.igual("quantificacao desconto sentinela pedidos", int(df_rdt06_pedidos["pedidos_com_sentinela"].iloc[0]), 4003, "Exatamente 4.003 pedidos do legado contêm itens com flag_desconto_sentinela")
 
 
 

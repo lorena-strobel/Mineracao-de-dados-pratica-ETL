@@ -118,6 +118,52 @@ Se integrados diretamente sem conformação, ocorreria contaminação semântica
 - `soma de mercadoria bate com itens`: validação de que a soma de `valor_mercadoria` nos pedidos coincide exatamente com a soma de `valor_bruto` nas linhas de itens. Resultado: 410.000 aprovados (0 divergências).
 Resultados auditados e persistidos na tabela `qa.execucao_assercao`.
 
+### Ficha RDT-06 — Tratamento de Frete Negativo e Desconto Sentinela `-1`
+
+**Decisão:** saneamento de anomalias operacionais de domínio nos componentes de valores: truncamento de valores de frete negativos para `0.00` via `GREATEST(0, frete)` com ativação de `flag_frete_negativo = TRUE`, e conversão de descontos sentinela `-1.00` para `0.00` com ativação de `flag_desconto_sentinela = TRUE`.
+
+**Etapa do pipeline:** 02_transformacao · `conforma_valores`
+
+**O que o dado mostrava:** 
+A inspeção da base consolidada em escala 1.0 (seed 20262) revelou duas anomalias que violam premissas de domínio físico e contábil:
+1. *Frete Negativo:* Presente em 1.174 pedidos (0,286% dos 410.000 pedidos), sendo 362 pedidos no ERP Legado (0,278% do canal; variação de -R$ 88,78 a -R$ 0,01; soma: -R$ 16.098,86; média: -R$ 44,47) e 812 pedidos no E-commerce (0,290% do canal; variação de -R$ 78,86 a -R$ 0,01; soma: -R$ 32.248,65; média: -R$ 39,72). No ERP Legado, a prova contábil demonstrou que em 100,0% dos 362 pedidos o total faturado subtraiu o frete negativo, evidenciando uso do campo como artifício para conceder subsídio logístico ou estorno comercial ao cliente. No total, as anomalias de frete perfazem -R$ 48.347,51.
+2. *Desconto Sentinela `-1`:* Presente em 4.056 linhas de itens do ERP Legado (1,021% dos itens do canal), afetando 4.003 pedidos distintos (3,079% dos pedidos do legado). Não existe nenhum outro valor negativo além do literal exato `-1.00`. No E-commerce, essa anomalia é inexistente (0 itens). Trata-se de código sentinela legado para indicar produto inelegível para descontos promocionais. Se calculado aritmeticamente na receita líquida ($\text{Preço} \times \text{QTD} - \text{Desconto}$), geraria $-(-1) = +1$, inflacionando artificialmente a receita em R$ 4.056,00.
+
+**Alternativas consideradas:**
+
+*Para Frete Negativo:*
+1. *Manter valores negativos brutos:* Descartada: gera custos de transporte negativos nos cubos OLAP do DW, distorcendo relatórios de despesas logísticas por transportadora e médias de frete por UF.
+2. *Inverter o sinal (`ABS(frete)`):* Descartada: arbitrária e contrafactual. A reconciliação do legado provou que o valor foi abatido e não cobrado a mais do cliente; inverter o sinal computaria cobrança indevida.
+3. *Truncar em `0.00` e registrar indicador de anomalia (`flag_frete_negativo`):* Estabelecer $\text{valor\_frete} = \max(0, \text{frete})$ e sinalizar a ocorrência com booleano.
+
+*Para Desconto Sentinela `-1`:*
+1. *Cálculo literal aritmético (-R$ 1,00):* Descartada: gera ganho fictício de receita líquida de R$ 1,00 por item.
+2. *Converter para `NULL`:* Descartada: viola a integridade dimensional de Kimball; nulos em métricas aditivas quebram agregações SQL (`SUM`, `AVG`).
+3. *Substituir por `0.00` e registrar indicador (`flag_desconto_sentinela`):* Mapear para zero monetário, preservando o significado de ausência de desconto financeiro real e retendo a flag para auditoria.
+
+**Decisão:** alternativa 3 para ambas as anomalias.
+
+**Justificativa:** Assegura a integridade de domínio físico e contábil em 100% da base: nenhum serviço de frete no DW possui custo negativo, e nenhum item tem sua receita inflacionada por um marcador de sistema. A conversão simultânea com sinalização por flags booleanas garante a conformidade matemática estrita exigida pelo esquema estrela, ao mesmo tempo em que retém rastreabilidade para mineração de regras de associação sobre falhas operacionais e estornos.
+
+**O que se perde:** 
+1. No frete, perde-se o registro contábil do subsídio logístico concedido aos clientes (-R$ 16.098,86 no legado e -R$ 32.248,65 no e-commerce, somando -R$ 48.347,51). O DW prioriza a métrica de custo físico de transporte sobre o estorno promocional.
+2. No desconto, perde-se a distinção nativa do ERP Legado entre item estruturalmente inelegível para promoção e item elegível com desconto zero, a menos que o analista consulte a flag de auditoria.
+
+**Registros afetados:** 
+- Frete negativo: 1.174 pedidos (0,286% da base total de 410.000 pedidos: 362 legado e 812 e-commerce).
+- Desconto sentinela `-1`: 4.056 itens (0,291% do total de 1.392.453 itens), distribuídos em 4.003 pedidos (0,976% dos pedidos do DW).
+
+**Asserção associada:** Etapa 02 (`02_transformacao.py`), asserções:
+- `frete não negativo dw`: valida se $\text{menor frete} \ge 0,00$. Resultado: menor = R$ 0,00 (0 negativos).
+- `desconto não negativo itens`: valida se $\text{menor desconto} \ge 0,00$. Resultado: menor = R$ 0,00 (0 negativos).
+- `desconto sem sentinela menos um`: valida se restou algum `-1` na base. Resultado: 0 ocorrências.
+- `quantificacao frete negativo consolidado`: valida contagem exata de 1.174 pedidos com `flag_frete_negativo = TRUE`.
+- `quantificacao frete negativo legado`: valida 362 pedidos no legado.
+- `quantificacao frete negativo ecom`: valida 812 pedidos no e-commerce.
+- `quantificacao desconto sentinela itens`: valida 4.056 itens com `flag_desconto_sentinela = TRUE`.
+- `quantificacao desconto sentinela pedidos`: valida 4.003 pedidos com `flag_desconto_sentinela = TRUE`.
+Todas auditadas e registradas na tabela `qa.execucao_assercao`.
+
 ---
 
 ## Tabela-resumo
@@ -129,7 +175,7 @@ Resultados auditados e persistidos na tabela `qa.execucao_assercao`.
 | RDT-03 | Deduplicação interna do legado | | | |
 | RDT-04 | Conformação de status de pedidos | | | |
 | RDT-05 | Decomposição contábil de VALOR_TOTAL e total_amount em 4 medidas | 410.000 pedidos | 100,0% | Sim (dependência de cabeçalho bruto substituída por identidade aditiva de itens) |
-| RDT-06 | Frete negativo e desconto -1 | | | |
+| RDT-06 | Truncamento de frete negativo e conversão de sentinela de desconto -1 | 1.174 pedidos (frete) / 4.056 itens (desconto) | 0,29% (pedidos) / 0,29% (itens) | Sim (subsídios de frete de R$ 48.347,51 descartados do frete faturado; inelegibilidade retida em flag) |
 | RDT-07 | Mapeamento de categorias de produto | | | |
 | RDT-08 | Classificação de ausências e sentinela 1900-01-01 | | | |
 | RDT-09 | Padronização temporal em UTC | | | |
