@@ -19,6 +19,7 @@ import re
 import unicodedata
 
 import pandas as pd
+from sqlalchemy import text
 
 from config import eng_dw
 from qualidade.assercoes import Suite
@@ -76,6 +77,7 @@ def unifica_clientes(qa):
     """
     print("-> Unifica Clientes...", flush=True)
     dw = eng_dw()
+    
     clientes_legado = pd.read_sql("SELECT * FROM stg.legado_clientes", dw)
     clientes_ecom= pd.read_sql("SELECT * FROM stg.ecommerce_customer", dw)
 
@@ -97,17 +99,15 @@ def unifica_clientes(qa):
     duplicatas_legado = clientes_legado.duplicated(subset=["cpf_limpo"]).sum()
 
     # uso do cadastro mais recente
-    legado_validos = clientes_legado[clientes_legado["cpf_valido"] == True].drop_duplicates(subset=["cpf_limpo"], keep="first")
+    legado_val = clientes_legado[clientes_legado["cpf_valido"] == True].drop_duplicates(subset=["cpf_limpo"], keep="first")
+    ecom_val = clientes_ecom[clientes_ecom["cpf_valido"] == True].drop_duplicates(subset=["cpf_limpo"], keep="first")
 
-    clientes_ecom = clientes_ecom.sort_values(by="created_at", ascending=False)
-    ecom_validos = clientes_ecom[clientes_ecom["cpf_valido"]==True].drop_duplicates(subset=["cpf_limpo"], keep="first")
-
-    # legado e ecommerce mergeado garantindo que mesmo que exista em somente uma das tabelas também ocorra o merge
-    cruzamento = pd.merge(legado_validos, ecom_validos, 
-            on="cpf_limpo", how="outer", suffixes=('_leg','_ecom')
+    # 2. Cruzamento principal por CPF Válido
+    cruzamento_cpf = pd.merge(
+        legado_val, ecom_val, 
+        on="cpf_limpo", how="outer", suffixes=('_leg', '_ecom')
     )
 
-    # origem da unificação 
     def define_origem(row):
         if pd.notna(row.get('id')) and pd.notna(row.get('customer_id')):
             return 'AMBOS'
@@ -115,27 +115,82 @@ def unifica_clientes(qa):
             return 'LEGADO'
         else:
             return 'ECOM'
-    
-    cruzamento['origem_unificacao'] = cruzamento.apply(define_origem, axis=1)
-    cruzamento['regra_pareamento'] = 'CPF_VALIDO'
 
-    # montagem final com as colunas
+    cruzamento_cpf['origem_unificacao'] = cruzamento_cpf.apply(define_origem, axis=1)
+    cruzamento_cpf['regra_pareamento'] = 'CPF_VALIDO'
+
+    # Montagem do DataFrame final da dimensão
     dim_cliente = pd.DataFrame({
-        'id_legado': cruzamento.get('id'),
-        'id_ecommerce': cruzamento.get('customer_id'),
-        'cpf_normalizado': cruzamento['cpf_limpo'],
-        'origem_unificacao': cruzamento['origem_unificacao'],
-        'regra_pareamento': cruzamento['regra_pareamento']
+        'id_legado': cruzamento_cpf.get('id'),
+        'id_ecommerce': cruzamento_cpf.get('customer_id'),
+        'cpf_normalizado': cruzamento_cpf['cpf_limpo'],
+        'origem_unificacao': cruzamento_cpf['origem_unificacao'],
+        'regra_pareamento': cruzamento_cpf['regra_pareamento']
     })
 
-    dim_cliente.to_sql("dim_cliente", dw, schema="dw", if_exists="replace", index=False)
+    # Remove eventuais linhas onde o CPF ficou nulo/vazio gerado por falhas no outer join bruto
+    dim_cliente = dim_cliente.dropna(subset=['cpf_normalizado'])
+    dim_cliente = dim_cliente[dim_cliente['cpf_normalizado'] != ""]
 
-    # Bloco para validar o resultado logo após a gravação
+    print(f"-> Total de clientes unificados estruturados: {len(dim_cliente)}")
+
+    print("-> Persistindo dim_cliente no DW de forma segura (Staging + UPSERT)...")
+
+    # 1. Grava em uma tabela temporária auxiliar no DW (sem restrições, o replace é seguro aqui)
+    dim_cliente.to_sql(
+        "temp_dim_cliente", 
+        dw, 
+        schema="dw", 
+        if_exists="replace", 
+        index=False
+    )
+
+    # Preserva as chaves estrangeiras das Fatos/ABT
+    upsert_sql = text("""
+        -- 1. Atualiza os dados dos clientes que já existem na tabela oficial baseando-se no CPF
+        UPDATE dw.dim_cliente AS dest
+        SET 
+            id_legado = NULLIF(src.id_legado::text, '')::integer,
+            id_ecommerce = NULLIF(src.id_ecommerce::text, '')::integer,
+            origem_unificacao = src.origem_unificacao,
+            regra_pareamento = src.regra_pareamento
+        FROM dw.temp_dim_cliente AS src
+        WHERE dest.cpf_normalizado = src.cpf_normalizado;
+
+        -- 2. Insere apenas os clientes novos (cujos CPFs ainda não existem em dw.dim_cliente)
+        INSERT INTO dw.dim_cliente (
+            id_legado, 
+            id_ecommerce, 
+            cpf_normalizado, 
+            origem_unificacao, 
+            regra_pareamento,
+            nome_padronizado
+        )
+        SELECT 
+            NULLIF(id_legado::text, '')::integer, 
+            NULLIF(id_ecommerce::text, '')::integer, 
+            src.cpf_normalizado, 
+            src.origem_unificacao, 
+            src.regra_pareamento,
+            'PENDENTE' -- caso a coluna exija not null no DDL do professor
+        FROM dw.temp_dim_cliente AS src
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dw.dim_cliente dest 
+            WHERE dest.cpf_normalizado = src.cpf_normalizado
+        );
+
+        -- 3. Limpeza da tabela temporária de staging
+        DROP TABLE IF EXISTS dw.temp_dim_cliente;
+    """)
+
+    with dw.begin() as conn:
+        conn.execute(upsert_sql)
+
+    # bloco de validação
     print("-> Verificando dados gravados em dw.dim_cliente...")
     df_verificacao = pd.read_sql("SELECT * FROM dw.dim_cliente LIMIT 5", dw)
     print(df_verificacao)
 
-    # Verificando quantos clientes caíram em cada categoria (AMBOS, LEGADO, ECOM)
     df_resumo = pd.read_sql("""
         SELECT origem_unificacao, regra_pareamento, COUNT(*) as total 
         FROM dw.dim_cliente 
@@ -143,9 +198,7 @@ def unifica_clientes(qa):
     """, dw)
     print("\nResumo da unificação:")
     print(df_resumo)
-    print(f"-> Processo concluído:  {len(dim_cliente)} clientes unificados")
-    print(f"-> Duplicatas removidas no legado: {duplicatas_legado}")
-                                   
+    print(f"-> Duplicatas internas removidas no legado: {duplicatas_legado}")
 
 
 # ===========================================================================
