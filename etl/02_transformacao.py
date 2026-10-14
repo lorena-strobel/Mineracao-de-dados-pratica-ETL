@@ -79,39 +79,45 @@ def unifica_clientes(qa):
     dw = eng_dw()
     
     clientes_legado = pd.read_sql("SELECT * FROM stg.legado_clientes", dw)
-    clientes_ecom= pd.read_sql("SELECT * FROM stg.ecommerce_customer", dw)
+    clientes_ecom = pd.read_sql("SELECT * FROM stg.ecommerce_customer", dw)
 
     clientes_legado.columns = [c.lower() for c in clientes_legado.columns]
     clientes_ecom.columns = [c.lower() for c in clientes_ecom.columns]
 
-    # Tratamento de CPF e dos nomes dos clientes do legado e do ecommerce
+    clientes_legado = clientes_legado.rename(columns={
+        'id': 'id_legado',
+        'nome': 'nome_cliente'
+    })
+
+    # Tratamento de CPF e dos nomes dos clientes
     clientes_legado["cpf_limpo"] = clientes_legado["cpf"].apply(so_digitos)
     clientes_legado["cpf_valido"] = clientes_legado["cpf_limpo"].apply(cpf_valido)
-    clientes_legado["nome_normalizado"] = clientes_legado["nome"].apply(normaliza_nome)
+    clientes_legado["nome_normalizado"] = clientes_legado["nome_cliente"].apply(normaliza_nome)
     
     clientes_ecom["cpf_limpo"] = clientes_ecom["tax_id"].apply(so_digitos)
     clientes_ecom["cpf_valido"] = clientes_ecom["cpf_limpo"].apply(cpf_valido)
     clientes_ecom["nome_normalizado"] = clientes_ecom["full_name"].apply(normaliza_nome)
 
-    # Tratamento das duplicatas internas do legado 
-    # Ordenamento pela data mais RECENTE para a mais ANTIGA
+    # Tratamento das duplicatas internas do legado (ordem decrescente de cadastro)
     clientes_legado = clientes_legado.sort_values(by="dt_cadastro", ascending=False)
     duplicatas_legado = clientes_legado.duplicated(subset=["cpf_limpo"]).sum()
 
-    # uso do cadastro mais recente
     legado_val = clientes_legado[clientes_legado["cpf_valido"] == True].drop_duplicates(subset=["cpf_limpo"], keep="first")
     ecom_val = clientes_ecom[clientes_ecom["cpf_valido"] == True].drop_duplicates(subset=["cpf_limpo"], keep="first")
 
-    # 2. Cruzamento principal por CPF Válido
+    # Cruzamento principal por CPF Válido
     cruzamento_cpf = pd.merge(
         legado_val, ecom_val, 
         on="cpf_limpo", how="outer", suffixes=('_leg', '_ecom')
     )
 
     def define_origem(row):
-        if pd.notna(row.get('id')) and pd.notna(row.get('customer_id')):
+        id_l = row.get('id_legado')
+        id_e = row.get('id_ecommerce')
+        
+        if pd.notna(id_l) and pd.notna(id_e):
             return 'AMBOS'
-        elif pd.notna(row.get('id')):
+        elif pd.notna(id_l):
             return 'LEGADO'
         else:
             return 'ECOM'
@@ -119,16 +125,22 @@ def unifica_clientes(qa):
     cruzamento_cpf['origem_unificacao'] = cruzamento_cpf.apply(define_origem, axis=1)
     cruzamento_cpf['regra_pareamento'] = 'CPF_VALIDO'
 
-    # Montagem do DataFrame final da dimensão
+    # Resolução do nome padronizado (prioriza e-commerce, senão legado, senão fallback)
+    cruzamento_cpf['nome_padronizado'] = cruzamento_cpf['nome_normalizado_ecom'].fillna(
+        cruzamento_cpf['nome_normalizado_leg']
+    ).fillna('DESCONHECIDO')
+
+    # Montagem do DataFrame final da dimensão contemplando as colunas do DDL
     dim_cliente = pd.DataFrame({
-        'id_legado': cruzamento_cpf.get('id'),
-        'id_ecommerce': cruzamento_cpf.get('customer_id'),
+        'id_legado': cruzamento_cpf.get('id_legado'),
+        'id_ecommerce': cruzamento_cpf.get('id_ecommerce'),
         'cpf_normalizado': cruzamento_cpf['cpf_limpo'],
+        'nome_padronizado': cruzamento_cpf['nome_padronizado'],
         'origem_unificacao': cruzamento_cpf['origem_unificacao'],
         'regra_pareamento': cruzamento_cpf['regra_pareamento']
     })
 
-    # Remove eventuais linhas onde o CPF ficou nulo/vazio gerado por falhas no outer join bruto
+    # Remove linhas onde o CPF ficou nulo/vazio
     dim_cliente = dim_cliente.dropna(subset=['cpf_normalizado'])
     dim_cliente = dim_cliente[dim_cliente['cpf_normalizado'] != ""]
 
@@ -136,7 +148,7 @@ def unifica_clientes(qa):
 
     print("-> Persistindo dim_cliente no DW de forma segura (Staging + UPSERT)...")
 
-    # 1. Grava em uma tabela temporária auxiliar no DW (sem restrições, o replace é seguro aqui)
+    # Grava na staging temporária do DW
     dim_cliente.to_sql(
         "temp_dim_cliente", 
         dw, 
@@ -145,48 +157,49 @@ def unifica_clientes(qa):
         index=False
     )
 
-    # Preserva as chaves estrangeiras das Fatos/ABT
+    # Executa o UPDATE + INSERT (Anti-Join UPSERT) preservando as 15 FKs e o DDL intocado
     upsert_sql = text("""
-        -- 1. Atualiza os dados dos clientes que já existem na tabela oficial baseando-se no CPF
+        -- Atualiza registros existentes
         UPDATE dw.dim_cliente AS dest
         SET 
             id_legado = NULLIF(src.id_legado::text, '')::integer,
-            id_ecommerce = NULLIF(src.id_ecommerce::text, '')::integer,
+            id_ecommerce = NULLIF(src.id_ecommerce::text, '')::bigint,
+            nome_padronizado = src.nome_padronizado,
             origem_unificacao = src.origem_unificacao,
             regra_pareamento = src.regra_pareamento
         FROM dw.temp_dim_cliente AS src
         WHERE dest.cpf_normalizado = src.cpf_normalizado;
 
-        -- 2. Insere apenas os clientes novos (cujos CPFs ainda não existem em dw.dim_cliente)
+        -- Insere registros novos
         INSERT INTO dw.dim_cliente (
             id_legado, 
             id_ecommerce, 
             cpf_normalizado, 
+            nome_padronizado,
             origem_unificacao, 
-            regra_pareamento,
-            nome_padronizado
+            regra_pareamento
         )
         SELECT 
             NULLIF(id_legado::text, '')::integer, 
-            NULLIF(id_ecommerce::text, '')::integer, 
+            NULLIF(id_ecommerce::text, '')::bigint, 
             src.cpf_normalizado, 
+            src.nome_padronizado,
             src.origem_unificacao, 
-            src.regra_pareamento,
-            'PENDENTE' -- caso a coluna exija not null no DDL do professor
+            src.regra_pareamento
         FROM dw.temp_dim_cliente AS src
         WHERE NOT EXISTS (
             SELECT 1 FROM dw.dim_cliente dest 
             WHERE dest.cpf_normalizado = src.cpf_normalizado
         );
 
-        -- 3. Limpeza da tabela temporária de staging
+        -- Limpeza da tabela temporária de staging
         DROP TABLE IF EXISTS dw.temp_dim_cliente;
     """)
 
     with dw.begin() as conn:
         conn.execute(upsert_sql)
 
-    # bloco de validação
+    # Bloco de validação
     print("-> Verificando dados gravados em dw.dim_cliente...")
     df_verificacao = pd.read_sql("SELECT * FROM dw.dim_cliente LIMIT 5", dw)
     print(df_verificacao)
@@ -199,7 +212,6 @@ def unifica_clientes(qa):
     print("\nResumo da unificação:")
     print(df_resumo)
     print(f"-> Duplicatas internas removidas no legado: {duplicatas_legado}")
-
 
 # ===========================================================================
 # DECISÃO 2 — CONFORMAÇÃO DE STATUS
@@ -272,7 +284,7 @@ def conforma_categorias(qa):
     autoriza apagar a evidência do que havia antes.
     """
     # TODO 2.4
-    raise NotImplementedError
+
 
 
 # ===========================================================================
