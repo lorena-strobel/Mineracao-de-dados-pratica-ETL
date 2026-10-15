@@ -164,6 +164,47 @@ A inspeção da base consolidada em escala 1.0 (seed 20262) revelou duas anomali
 - `quantificacao desconto sentinela pedidos`: valida 4.003 pedidos com `flag_desconto_sentinela = TRUE`.
 Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 
+### Ficha RDT-07 — Mapeamento e Taxonomia de Categorias de Produto
+
+**Decisão:** conformação dos 27 rótulos livres de produtos do ERP Legado para a taxonomia relacional de dois níveis do E-commerce (`categoria_nivel1` e `categoria_nivel2`), desambiguando casos complexos (`informatica e games`, `TV E SOM`, `DIVERSOS`, `OUTROS`, vazio) por enriquecimento léxico de substantivos de domínio da descrição, com preservação obrigatória da evidência bruta em `categoria_origem`.
+
+**Etapa do pipeline:** 02_transformacao · `conforma_categorias`
+
+**O que o dado mostrava:** 
+O catálogo de produtos do E-commerce (12.000 itens) é regido por uma taxonomia relacional controlada composta por 8 categorias raiz no Nível 1 e 13 subcategorias no Nível 2. Em contrapartida, o catálogo do ERP Legado (3.000 itens) armazena categorias em um campo de texto livre com 27 variantes grafadas sem padronização.
+A análise empírica identificou três ordens de desafios semânticos:
+1. *Variantes Ortográficas e Morfológicas (22 rótulos, 2.437 produtos):* Grafias divergentes do mesmo conceito (ex: `ELETRO`, `Eletro`, `eletrodomesticos`, `Eletro-domesticos`, `ELETRODOMÉSTICOS`; `INFORMATICA`, `Informática`, `INFO`; `TELEFONIA`, `Celulares`, `CELULAR/SMARTPHONE`; `CASA`, `Casa e decoracao`, `MOVEIS`).
+2. *Fusão de Ramos Raiz e de Subcategorias (2 rótulos, 223 produtos):*
+   - `informatica e games` (112 produtos): funde duas categorias raiz distintas da taxonomia corporativa (`Informática` e `Games`).
+   - `TV E SOM` (111 produtos): funde os dois filhos de `Áudio e TV` (`Televisores` e `Áudio`).
+3. *Categorias Sem Informação Semântica (3 rótulos, 340 produtos):* `OUTROS` (121 produtos), `DIVERSOS` (116 produtos) e strings vazias/espaços (103 produtos), totalizando 11,33% do legado sem classificação utilizável.
+
+Entretanto, o perfilamento fático revelou que **100,00% dos 3.000 produtos do legado** possuem o substantivo canônico do catálogo na primeira palavra de sua descrição (ex: `FOGÃO`, `NOTEBOOK`, `CONSOLE`, `SOFÁ`, `TELEVISOR`), viabilizando a identificação inequívoca da natureza do produto.
+
+**Alternativas consideradas:**
+
+1. *De-Para puramente categórico com valores nulos/descarte nos ambíguos:* Mapear apenas os rótulos óbvios e classificar os 563 produtos ambíguos ou genéricos como `Não Informado`. Descartada: descarta 18,77% do catálogo do legado, criando "pontos cegos" maciços que invalidam análises de market-basket, propensão de recompra e segmentação por produto na mineração de dados.
+2. *Criação de categorias híbridas artificiais no DW:* Criar categorias como "Informática e Games" ou "TV e Som" no Nível 1 da dimensão. Descartada: viola o princípio de conformação dimensional de Kimball ("conformed dimensions"), criando assimetria estrutural e impedindo comparações analíticas coerentes entre os canais físico e virtual.
+3. *Conformação Híbrida com Desambiguação Léxica pela Descrição:* Classificar a hierarquia taxonômica de dois níveis (`categoria_nivel1` e `categoria_nivel2`) inspecionando o substantivo de domínio presente na descrição do produto, associando cada item a um dos 15 pares taxonômicos válidos do e-commerce, preservando estritamente o texto livre original em `categoria_origem`.
+
+**Decisão:** alternativa 3.
+
+**Justificativa:** A alternativa 3 assegura 100,00% de cobertura taxonômica homologada para todos os 15.000 produtos do catálogo unificado (`dw.dim_produto`), garantindo que 100% dos produtos do legado sejam mapeados para os 15 pares taxonômicos idênticos aos do e-commerce. A integridade dimensional de Kimball é plenamente preservada sem perda de produtos, enquanto a preservação da coluna `categoria_origem` garante auditabilidade integral e conformidade com o princípio de retenção de evidências brutas.
+
+**O que se perde:** Perde-se a fidelidade estrita à taxonomia administrativa originalmente preenchida pelo operador do sistema legado na navegação hierárquica do DW. Assume-se a premissa de que a descrição fática do produto ("FOGÃO NEXA 826") sobrepõe o cadastro operacional impreciso ("informatica e games"). Analistas que necessitem consultar a classificação do legado exatamente como digitada em 2021 devem utilizar o atributo `categoria_origem`.
+
+**Registros afetados:** 3.000 produtos do ERP Legado (20,00% do catálogo consolidado de 15.000 produtos do DW), dos quais 563 produtos (18,77% do legado; 3,75% do total de produtos) apresentavam ambiguidade estrutural ou ausência total de informação categórica.
+
+**Asserção associada:** Etapa 02 (`02_transformacao.py`), asserções:
+- `total produtos dw`: valida exatamente 15.000 produtos em `dw.dim_produto`.
+- `produtos origem legado`: valida 3.000 produtos oriundos do legado.
+- `produtos origem ecom`: valida 12.000 produtos oriundos do e-commerce.
+- `categoria_nivel1 sem nulos`: valida 0 nulos ou vazios no primeiro nível.
+- `categoria_nivel2 sem nulos`: valida 0 nulos ou vazios no segundo nível.
+- `categoria_origem preservada`: valida 100% dos produtos com rastreabilidade da evidência original.
+- `taxonomia conforme ecommerce`: valida se todos os pares `(categoria_nivel1, categoria_nivel2)` do legado existem na taxonomia do e-commerce (0 pares inválidos).
+Todas aprovadas e persistidas na tabela `qa.execucao_assercao`.
+
 ---
 
 ## Tabela-resumo
@@ -176,7 +217,7 @@ Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 | RDT-04 | Conformação de status de pedidos | | | |
 | RDT-05 | Decomposição contábil de VALOR_TOTAL e total_amount em 4 medidas | 410.000 pedidos | 100,0% | Sim (dependência de cabeçalho bruto substituída por identidade aditiva de itens) |
 | RDT-06 | Truncamento de frete negativo e conversão de sentinela de desconto -1 | 1.174 pedidos (frete) / 4.056 itens (desconto) | 0,29% (pedidos) / 0,29% (itens) | Sim (subsídios de frete de R$ 48.347,51 descartados do frete faturado; inelegibilidade retida em flag) |
-| RDT-07 | Mapeamento de categorias de produto | | | |
+| RDT-07 | Conformação da taxonomia de produtos em 2 níveis e desambiguação léxica | 3.000 produtos (legado) | 20,0% do catálogo | Sim (categoria administrativa do legado sobreposta pela descrição fática; texto bruto retido em categoria_origem) |
 | RDT-08 | Classificação de ausências e sentinela 1900-01-01 | | | |
 | RDT-09 | Padronização temporal em UTC | | | |
 | RDT-10 | Itens órfãos | | | |

@@ -503,21 +503,147 @@ def conforma_valores(qa):
 # DECISÃO 4 — TAXONOMIA DE PRODUTO
 # ===========================================================================
 def conforma_categorias(qa):
-    """
-    O legado guarda categoria como texto livre ('ELETRO', 'Eletro-domesticos',
-    'informatica e games', 'DIVERSOS', ''); o e-commerce tem taxonomia de dois
-    níveis. Construa o mapeamento.
+    print("-> Conformando taxonomia de categorias de produto (Decisão 4 / RDT-07)...", flush=True)
+    dw = eng_dw()
 
-    Casos que não têm solução limpa — e é esse o ponto:
-      · 'informatica e games' cobre dois ramos distintos da taxonomia;
-      · 'DIVERSOS', 'OUTROS' e '' não informam nada;
-      · 'TV E SOM' cobre dois filhos de 'Áudio e TV'.
+    with dw.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE dw.dim_produto RESTART IDENTITY CASCADE;"))
 
-    Mantenha categoria_origem preenchida com o valor bruto. Conformar não
-    autoriza apagar a evidência do que havia antes.
-    """
-    # TODO 2.4
+        # 1. Inserção dos produtos conformados do E-commerce
+        conn.execute(text("""
+            INSERT INTO dw.dim_produto (
+                sku,
+                descricao,
+                categoria_nivel1,
+                categoria_nivel2,
+                categoria_origem,
+                preco_referencia,
+                ativo,
+                id_legado,
+                id_ecommerce,
+                origem
+            )
+            SELECT 
+                pr.sku,
+                pr.title as descricao,
+                COALESCE(pai.name, c.name) as categoria_nivel1,
+                CASE WHEN pai.name IS NOT NULL THEN c.name ELSE 'Geral' END as categoria_nivel2,
+                c.name as categoria_origem,
+                pr.list_price::numeric(12,2) as preco_referencia,
+                pr.active as ativo,
+                NULL::int as id_legado,
+                pr.product_id as id_ecommerce,
+                'ECOM' as origem
+            FROM stg.ecommerce_product pr
+            JOIN stg.ecommerce_category c ON pr.category_id = c.category_id
+            LEFT JOIN stg.ecommerce_category pai ON c.parent_id = pai.category_id;
+        """))
 
+        # 2. Inserção dos produtos conformados do ERP Legado
+        conn.execute(text("""
+            INSERT INTO dw.dim_produto (
+                sku,
+                descricao,
+                categoria_nivel1,
+                categoria_nivel2,
+                categoria_origem,
+                preco_referencia,
+                ativo,
+                id_legado,
+                id_ecommerce,
+                origem
+            )
+            SELECT 
+                NULL as sku,
+                "DESCRICAO" as descricao,
+                CASE 
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('GELADEIRA', 'FOGÃO', 'LAVADORA', 'SECADORA', 'MICRO-ONDAS', 'AR-CONDICIONADO') THEN 'Eletrodomésticos'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('LIQUIDIFICADOR', 'BATEDEIRA', 'CAFETEIRA', 'ASPIRADOR', 'VENTILADOR', 'PURIFICADOR') THEN 'Eletrodomésticos'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('NOTEBOOK', 'DESKTOP', 'MONITOR', 'TECLADO', 'MOUSE', 'HEADSET', 'IMPRESSORA', 'ROTEADOR', 'SSD', 'MEMÓRIA', 'COOLER', 'FONTE') THEN 'Informática'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('CONSOLE', 'CONTROLE', 'JOGO') THEN 'Games'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SMARTPHONE', 'FONE', 'CARREGADOR', 'CAPA', 'SMARTWATCH') THEN 'Telefonia'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SOFÁ', 'CADEIRA', 'MESA', 'ESTANTE', 'COLCHÃO', 'LENÇOL', 'TOALHA') THEN 'Casa e Decoração'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('BICICLETA', 'ESTEIRA', 'HALTER') THEN 'Esporte e Lazer'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('FURADEIRA', 'PARAFUSADEIRA', 'SERRA') THEN 'Ferramentas'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('TELEVISOR', 'SOUNDBAR', 'CAIXA', 'RECEIVER', 'HEADPHONE') THEN 'Áudio e TV'
+                    ELSE 'Outros'
+                END as categoria_nivel1,
+                CASE 
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('GELADEIRA', 'FOGÃO', 'LAVADORA', 'SECADORA', 'MICRO-ONDAS', 'AR-CONDICIONADO') THEN 'Linha Branca'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('LIQUIDIFICADOR', 'BATEDEIRA', 'CAFETEIRA', 'ASPIRADOR', 'VENTILADOR', 'PURIFICADOR') THEN 'Eletroportáteis'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('NOTEBOOK') THEN 'Notebooks'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('MONITOR', 'TECLADO', 'MOUSE', 'HEADSET', 'IMPRESSORA', 'ROTEADOR') THEN 'Periféricos'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('DESKTOP', 'SSD', 'MEMÓRIA', 'COOLER', 'FONTE') THEN 'Componentes'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('CONSOLE', 'CONTROLE') THEN 'Consoles'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('JOGO') THEN 'Jogos'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SMARTPHONE') THEN 'Smartphones'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('FONE', 'CARREGADOR', 'CAPA', 'SMARTWATCH') THEN 'Acessórios de Telefonia'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SOFÁ', 'CADEIRA', 'MESA', 'ESTANTE') THEN 'Móveis'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('COLCHÃO', 'LENÇOL', 'TOALHA') THEN 'Cama, Mesa e Banho'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('BICICLETA', 'ESTEIRA', 'HALTER') THEN 'Geral'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('FURADEIRA', 'PARAFUSADEIRA', 'SERRA') THEN 'Geral'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('TELEVISOR') THEN 'Televisores'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SOUNDBAR', 'CAIXA', 'RECEIVER', 'HEADPHONE') THEN 'Áudio'
+                    ELSE 'Geral'
+                END as categoria_nivel2,
+                COALESCE("CATEGORIA", '') as categoria_origem,
+                "PRECO_TABELA"::numeric(12,2) as preco_referencia,
+                ("ATIVO" = 'S') as ativo,
+                "ID_PRODUTO" as id_legado,
+                NULL::bigint as id_ecommerce,
+                'LEGADO' as origem
+            FROM stg.legado_produtos;
+        """))
+
+    # 3. Asserções de qualidade da Decisão 4 (RDT-07)
+    with dw.connect() as cx:
+        df_qa_prod = pd.read_sql("""
+            SELECT 
+                COUNT(*) as total_produtos,
+                SUM(CASE WHEN origem = 'LEGADO' THEN 1 ELSE 0 END) as total_legado,
+                SUM(CASE WHEN origem = 'ECOM' THEN 1 ELSE 0 END) as total_ecom,
+                SUM(CASE WHEN categoria_nivel1 IS NULL OR TRIM(categoria_nivel1) = '' THEN 1 ELSE 0 END) as nulos_nivel1,
+                SUM(CASE WHEN categoria_nivel2 IS NULL OR TRIM(categoria_nivel2) = '' THEN 1 ELSE 0 END) as nulos_nivel2,
+                SUM(CASE WHEN categoria_origem IS NULL THEN 1 ELSE 0 END) as nulos_origem,
+                COUNT(DISTINCT categoria_nivel1) as qtd_nivel1_distintos,
+                COUNT(DISTINCT categoria_nivel2) as qtd_nivel2_distintos
+            FROM dw.dim_produto
+        """, cx)
+
+        df_check_pares = pd.read_sql("""
+            WITH pares_ecom AS (
+                SELECT DISTINCT categoria_nivel1, categoria_nivel2
+                FROM dw.dim_produto
+                WHERE origem = 'ECOM'
+            ),
+            pares_leg AS (
+                SELECT DISTINCT categoria_nivel1, categoria_nivel2
+                FROM dw.dim_produto
+                WHERE origem = 'LEGADO'
+            )
+            SELECT COUNT(*) as pares_legado_invalidos
+            FROM pares_leg l
+            LEFT JOIN pares_ecom e 
+                ON l.categoria_nivel1 = e.categoria_nivel1 
+               AND l.categoria_nivel2 = e.categoria_nivel2
+            WHERE e.categoria_nivel1 IS NULL
+        """, cx)
+
+    total_prods = int(df_qa_prod["total_produtos"].iloc[0])
+    total_leg = int(df_qa_prod["total_legado"].iloc[0])
+    total_ecom = int(df_qa_prod["total_ecom"].iloc[0])
+    nulos_n1 = int(df_qa_prod["nulos_nivel1"].iloc[0])
+    nulos_n2 = int(df_qa_prod["nulos_nivel2"].iloc[0])
+    nulos_orig = int(df_qa_prod["nulos_origem"].iloc[0])
+    pares_invalidos = int(df_check_pares["pares_legado_invalidos"].iloc[0])
+
+    qa.igual("total produtos dw", total_prods, 15000, "15.000 produtos no catálogo unificado de dw.dim_produto")
+    qa.igual("produtos origem legado", total_leg, 3000, "3.000 produtos oriundos do ERP Legado")
+    qa.igual("produtos origem ecom", total_ecom, 12000, "12.000 produtos oriundos do E-commerce")
+    qa.igual("categoria_nivel1 sem nulos", nulos_n1, 0, "Nenhum produto pode ter categoria_nivel1 nula ou vazia")
+    qa.igual("categoria_nivel2 sem nulos", nulos_n2, 0, "Nenhum produto pode ter categoria_nivel2 nula ou vazia")
+    qa.igual("categoria_origem preservada", nulos_orig, 0, "Evidência de categoria_origem preservada em 100% dos produtos")
+    qa.igual("taxonomia conforme ecommerce", pares_invalidos, 0, "Todos os pares taxonômicos do legado pertencem à taxonomia válida do e-commerce")
 
 
 # ===========================================================================
