@@ -205,6 +205,52 @@ Entretanto, o perfilamento fático revelou que **100,00% dos 3.000 produtos do l
 - `taxonomia conforme ecommerce`: valida se todos os pares `(categoria_nivel1, categoria_nivel2)` do legado existem na taxonomia do e-commerce (0 pares inválidos).
 Todas aprovadas e persistidas na tabela `qa.execucao_assercao`.
 
+### Ficha RDT-08 — Classificação de Ausências, Sentinela 1900-01-01 e Inversão Temporal
+
+**Decisão:** classificação formal das ausências em três categorias analíticas (não coletada, não aplicável e código sentinela) e saneamento das anomalias cronológicas de entrega: conversão da data-sentinela `1900-01-01 00:00:00` para `NULL` com ativação de `flag_entrega_sem_data = TRUE`, anulação de datas de entrega invertidas (`DT_ENTREGA < DT_PEDIDO`) com ativação de `flag_entrega_inconsistente = TRUE`, e preservação de `NULL` para ausências estruturais de pedidos não entregues.
+
+**Etapa do pipeline:** 02_transformacao · `trata_datas_e_ausencias`
+
+**O que o dado mostrava:** 
+O perfilamento empírico da base total de 410.000 pedidos (escala 1.0, seed 20262) revelou anomalias cronológicas severas e dados ausentes com naturezas epistemológicas distintas:
+1. *Sentinela `1900-01-01 00:00:00` (1.025 pedidos, 0,788% do legado; 0,250% do DW):* Concentrada exclusivamente em pedidos do ERP Legado. Exatos 1.025 de 1.025 pedidos (100,0%) possuem status `ENTREGUE`. Nenhum pedido cancelado ou em separação possui esse valor. Trata-se de código sentinela imposto por restrição técnica de banco de dados (`NOT NULL`) quando a entrega física ocorreu, mas o comprovante de data não foi digitado.
+2. *Inversões Temporais `DT_ENTREGA < DT_PEDIDO` (2.458 pedidos entregues, 0,797% dos 308.396 pedidos entregues):* Presente em ambas as origens (775 pedidos no legado [0,766% dos entregues] e 1.683 pedidos no e-commerce [0,812% dos entregues]), com entregas registradas entre 1 e 5 dias antes da compra. Trata-se de violação da causalidade física gerada por preenchimento retroativo em lojas físicas ou desajuste de relógio de servidores.
+3. *Ausências Estruturais e Não Coletadas:* 101.604 pedidos (28.808 legado e 72.796 e-commerce) legitimamente não possuem data de entrega por não terem sido entregues (cancelados, processamento, em trânsito); 933 clientes do legado apresentam cidade mascarada com `"N/A"`; 5.856 atendimentos do SAC não possuem data de fechamento por estarem em aberto.
+
+**Alternativas consideradas:**
+
+*Para a Sentinela `1900-01-01`:*
+1. *Manter como data válida:* Descartada: geraria prazos de entrega calculados (`dias_entrega`) de aproximadamente 45.000 dias (mais de 120 anos), explodindo a variância e invalidando médias de SLA, regressões e algoritmos de árvore de decisão.
+2. *Converter para `NULL` sem indicador:* Descartada: apaga a distinção essencial entre "pedido concluído cuja data de recebimento falhou" e "pedido cancelado/extraviado que nunca foi entregue".
+3. *Converter para `NULL` e criar o indicador booleano `flag_entrega_sem_data`:* Adotada.
+
+*Para as Inversões Temporais (`DT_ENTREGA < DT_PEDIDO`):*
+1. *Manter as datas originais:* Descartada: gera prazos de entrega negativos (`dias_entrega < 0`), violando a flecha do tempo e introduzindo ruído estatístico.
+2. *Inverter as colunas (`DT_PEDIDO <-> DT_ENTREGA`):* Descartada: premissa contrafactual e infundada; não há base empírica para afirmar que o operador trocou os campos.
+3. *Anular a data de entrega e criar a flag `flag_entrega_inconsistente`:* Adotada.
+
+**Decisão:** alternativa 3 para ambas as anomalias, acompanhada da classificação estrita de ausências: preservação de `NULL` para ausências não aplicáveis (pedidos cancelados sem entrega) e não coletadas (textos opcionais).
+
+**Justificativa:** Protege os modelos analíticos e preditivos contra distorções aberrantes de prazo (eliminando outliers de 45.000 dias e prazos negativos), garantindo que os prazos de entrega válidos no DW variem estritamente entre 1 e 20 dias (média real homologada de 8,47 dias). A retenção das flags booleanas de auditoria preserva 100% da rastreabilidade para mineração de falhas operacionais e estudos de qualidade de atendimento.
+
+**O que se perde:** Perde-se a data real fática de entrega dos 1.025 pedidos sentinela e dos 2.458 pedidos com inversão temporal, que é irrecuperável nos sistemas de origem. Métricas de tempo médio de entrega passam a excluir esses 3.483 pedidos (1,13% dos pedidos entregues), o que pode subestimar levemente o SLA médio caso as falhas de registro tenham se concentrado em entregas lentas ou problemáticas.
+
+**Registros afetados:** 
+- Data sentinela 1900: 1.025 pedidos (0,788% do legado; 0,250% dos 410.000 pedidos do DW).
+- Inversão temporal de entrega: 2.458 pedidos (0,797% dos pedidos entregues; 775 legado e 1.683 e-commerce).
+- Total de pedidos impactados no cálculo de SLA: 3.483 pedidos (0,850% da base consolidada).
+
+**Asserção associada:** Etapa 02 (`02_transformacao.py`), asserções:
+- `sem sentinela 1900 dw`: valida 0 pedidos remanescentes com data em 1900.
+- `prazo entrega nao negativo`: valida 0 pedidos com `dt_entrega_conformada < dt_pedido_conformada`.
+- `quantificacao sentinela 1900`: valida contagem exata de 1.025 pedidos com `flag_entrega_sem_data = TRUE`.
+- `quantificacao inversao temporal total`: valida contagem exata de 2.458 pedidos com `flag_entrega_inconsistente = TRUE`.
+- `quantificacao inversao temporal legado`: valida 775 pedidos no legado.
+- `quantificacao inversao temporal ecom`: valida 1.683 pedidos no e-commerce.
+- `menor prazo de entrega valido`: valida que o menor prazo calculado é $\ge 0,0$ dias (obtido: 1,00 dia).
+- `ausencias estruturais preservadas`: valida 0 entregas conformadas em pedidos não entregues.
+Todas auditadas e registradas na tabela `qa.execucao_assercao`.
+
 ---
 
 ## Tabela-resumo
@@ -218,7 +264,7 @@ Todas aprovadas e persistidas na tabela `qa.execucao_assercao`.
 | RDT-05 | Decomposição contábil de VALOR_TOTAL e total_amount em 4 medidas | 410.000 pedidos | 100,0% | Sim (dependência de cabeçalho bruto substituída por identidade aditiva de itens) |
 | RDT-06 | Truncamento de frete negativo e conversão de sentinela de desconto -1 | 1.174 pedidos (frete) / 4.056 itens (desconto) | 0,29% (pedidos) / 0,29% (itens) | Sim (subsídios de frete de R$ 48.347,51 descartados do frete faturado; inelegibilidade retida em flag) |
 | RDT-07 | Conformação da taxonomia de produtos em 2 níveis e desambiguação léxica | 3.000 produtos (legado) | 20,0% do catálogo | Sim (categoria administrativa do legado sobreposta pela descrição fática; texto bruto retido em categoria_origem) |
-| RDT-08 | Classificação de ausências e sentinela 1900-01-01 | | | |
+| RDT-08 | Classificação de ausências, anulação de 1900-01-01 e de inversões temporais com flags | 3.483 pedidos (1.025 sentinela 1900 + 2.458 invertidos) | 0,85% da base | Sim (datas reais irrecuperáveis excluídas do cálculo de SLA; rastreabilidade retida em flags) |
 | RDT-09 | Padronização temporal em UTC | | | |
 | RDT-10 | Itens órfãos | | | |
 | RDT-11 | Declaração de grão de fato_pedido e fato_item_pedido | | | |

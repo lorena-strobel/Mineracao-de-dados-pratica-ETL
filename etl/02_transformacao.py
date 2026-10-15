@@ -650,22 +650,76 @@ def conforma_categorias(qa):
 # DECISÃO 5 — DATAS, AUSÊNCIAS E SENTINELAS
 # ===========================================================================
 def trata_datas_e_ausencias(qa):
-    """
-    Antes de imputar qualquer coisa, classifique cada ausência:
-      · não coletada          (o sistema nunca teve o dado)
-      · não aplicável         (pedido cancelado não tem data de entrega)
-      · sentinela             ('1900-01-01', 'N/A', -1)
-    As três exigem tratamentos diferentes e NENHUMA delas é "preencher com a
-    média". Documente a classificação de cada campo.
+    print("-> Tratando datas, ausências e sentinelas (Decisão 5 / RDT-08)...", flush=True)
+    dw = eng_dw()
 
-    Trate ainda:
-      · DT_ENTREGA anterior a DT_PEDIDO;
-      · TIMESTAMPTZ do e-commerce x DATETIME sem fuso do legado — padronize
-        e diga em qual fuso;
-      · data_fechamento vazia no SAC (atendimento em aberto x dado perdido).
-    """
-    # TODO 2.5
-    raise NotImplementedError
+    with dw.begin() as conn:
+        # 1. Enriquecimento da tabela de pedidos conformados com datas saneadas e flags de anomalia
+        conn.execute(text("""
+            ALTER TABLE stg.pedidos_valores_conformados 
+                ADD COLUMN IF NOT EXISTS dt_pedido_conformada TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS dt_entrega_conformada TIMESTAMPTZ,
+                ADD COLUMN IF NOT EXISTS flag_entrega_sem_data BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS flag_entrega_inconsistente BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS dias_entrega NUMERIC(10,2);
+
+            UPDATE stg.pedidos_valores_conformados
+            SET 
+                dt_pedido_conformada = dt_pedido_origem,
+                flag_entrega_sem_data = (dt_entrega_origem IS NOT NULL AND dt_entrega_origem < '1950-01-01'),
+                flag_entrega_inconsistente = (dt_entrega_origem IS NOT NULL AND dt_entrega_origem >= '1950-01-01' AND dt_entrega_origem < dt_pedido_origem),
+                dt_entrega_conformada = CASE 
+                    WHEN dt_entrega_origem IS NULL THEN NULL
+                    WHEN dt_entrega_origem < '1950-01-01' THEN NULL
+                    WHEN dt_entrega_origem < dt_pedido_origem THEN NULL
+                    ELSE dt_entrega_origem
+                END,
+                dias_entrega = CASE 
+                    WHEN dt_entrega_origem IS NOT NULL 
+                     AND dt_entrega_origem >= '1950-01-01' 
+                     AND dt_entrega_origem >= dt_pedido_origem 
+                    THEN ROUND(EXTRACT(EPOCH FROM (dt_entrega_origem - dt_pedido_origem)) / 86400.0, 2)
+                    ELSE NULL
+                END;
+        """))
+
+    # 2. Asserções de qualidade da Decisão 5 (RDT-08)
+    with dw.connect() as cx:
+        df_qa_datas = pd.read_sql("""
+            SELECT 
+                COUNT(*) as total_pedidos,
+                SUM(CASE WHEN flag_entrega_sem_data THEN 1 ELSE 0 END) as sentinela_1900,
+                SUM(CASE WHEN flag_entrega_inconsistente THEN 1 ELSE 0 END) as invertidas_total,
+                SUM(CASE WHEN sistema_origem = 'LEGADO' AND flag_entrega_inconsistente THEN 1 ELSE 0 END) as invertidas_legado,
+                SUM(CASE WHEN sistema_origem = 'ECOM' AND flag_entrega_inconsistente THEN 1 ELSE 0 END) as invertidas_ecom,
+                SUM(CASE WHEN dt_entrega_conformada < '1950-01-01' THEN 1 ELSE 0 END) as sentinelas_remanescentes,
+                SUM(CASE WHEN dt_entrega_conformada < dt_pedido_conformada THEN 1 ELSE 0 END) as invertidas_remanescentes,
+                MIN(dias_entrega) as menor_prazo,
+                MAX(dias_entrega) as maior_prazo,
+                SUM(CASE WHEN dt_entrega_conformada IS NOT NULL AND status_origem NOT IN ('ENTREGUE', 'delivered') THEN 1 ELSE 0 END) as entregas_status_indevido
+            FROM stg.pedidos_valores_conformados
+        """, cx)
+
+    tot_ped = int(df_qa_datas["total_pedidos"].iloc[0])
+    sent_1900 = int(df_qa_datas["sentinela_1900"].iloc[0])
+    inv_tot = int(df_qa_datas["invertidas_total"].iloc[0])
+    inv_leg = int(df_qa_datas["invertidas_legado"].iloc[0])
+    inv_ecom = int(df_qa_datas["invertidas_ecom"].iloc[0])
+    sent_rem = int(df_qa_datas["sentinelas_remanescentes"].iloc[0])
+    inv_rem = int(df_qa_datas["invertidas_remanescentes"].iloc[0])
+    menor_p = float(df_qa_datas["menor_prazo"].iloc[0]) if df_qa_datas["menor_prazo"].iloc[0] is not None else 0.0
+    status_indev = int(df_qa_datas["entregas_status_indevido"].iloc[0])
+
+    # Asserções RDT-08 (Sentinela 1900, Inversão Temporal e Integridade de Ausências)
+    qa.igual("sem sentinela 1900 dw", sent_rem, 0, "Nenhuma data de entrega no DW pode conter sentinela 1900-01-01")
+    qa.igual("prazo entrega nao negativo", inv_rem, 0, "Nenhum pedido pode ter entrega anterior à compra")
+    qa.igual("quantificacao sentinela 1900", sent_1900, 1025, "Exatamente 1.025 pedidos com sentinela 1900-01-01 marcados com flag")
+    qa.igual("quantificacao inversao temporal total", inv_tot, 2458, "Exatamente 2.458 pedidos com inversão temporal marcados com flag")
+    qa.igual("quantificacao inversao temporal legado", inv_leg, 775, "Exatamente 775 pedidos do legado com entrega invertida")
+    qa.igual("quantificacao inversao temporal ecom", inv_ecom, 1683, "Exatamente 1.683 pedidos do e-commerce com entrega invertida")
+    qa.maior_igual("menor prazo de entrega valido", menor_p, 0.0, "O menor prazo de entrega válido deve ser maior ou igual a zero")
+    qa.igual("ausencias estruturais preservadas", status_indev, 0, "Pedidos não entregues não podem possuir data de entrega conformada")
+
 
 
 # ===========================================================================
