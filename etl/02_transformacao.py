@@ -272,8 +272,48 @@ def conforma_status(qa):
     Escolha e preencha dw.dim_status. Registre quantos pedidos caem em cada
     célula do mapeamento — esse número é parte da justificativa.
     """
-    # TODO 2.2
-    raise NotImplementedErro
+    print("-> Conforma Status...", flush=True)
+    dw = eng_dw()
+
+    dados_status = [
+
+        # Legado
+        {"status_origem": "ENTREGUE", "sistema": "LEGADO", "status_conformado": "ENTREGUE", "motivo_cancelamento": None},
+        {"status_origem": "EM TRANSITO", "sistema": "LEGADO", "status_conformado": "EM_TRANSITO", "motivo_cancelamento": None},
+        {"status_origem": "SEPARACAO", "sistema": "LEGADO", "status_conformado": "PROCESSAMENTO", "motivo_cancelamento": None},
+        {"status_origem": "CANCELADO", "sistema": "LEGADO", "status_conformado": "CANCELADO", "motivo_cancelamento": None},
+
+        # E-commerce
+        {"status_origem": "delivered", "sistema": "ECOMMERCE", "status_conformado": "ENTREGUE", "motivo_cancelamento": None},
+        {"status_origem": "shipped", "sistema": "ECOMMERCE", "status_conformado": "EM_TRANSITO", "motivo_cancelamento": None},
+        {"status_origem": "processing", "sistema": "ECOMMERCE", "status_conformado": "PROCESSAMENTO", "motivo_cancelamento": None},
+        {"status_origem": "canceled", "sistema": "ECOMMERCE", "status_conformado": "CANCELADO", "motivo_cancelamento": "DESISTENCIA_CLIENTE"},
+        {"status_origem": "payment_declined", "sistema": "ECOMMERCE", "status_conformado": "CANCELADO", "motivo_cancelamento": "RECUSA_PAGAMENTO"}
+    ]
+    
+    df_status = pd.DataFrame(dados_status)
+
+    # Gravação na dimensão
+    with dw.begin() as conn:
+        conn.execute(text("TRUNCATE dw.dim_status RESTART IDENTITY CASCADE;"))
+    
+    df_status.to_sql("dim_status", dw, schema="dw", if_exists="append", index=False)
+    print("-> Gravando dw.dim_status...")
+
+    # Contagem de pedidos por status para subsidiar o RDT-04
+    pedidos_leg = pd.read_sql('SELECT "STATUS" as status_origem, COUNT(*) as qtd_pedidos FROM stg.legado_pedidos GROUP BY "STATUS"', dw)
+    pedidos_leg["sistema"] = "LEGADO"
+    pedidos_ecom = pd.read_sql("SELECT status as status_origem, COUNT(*) as qtd_pedidos FROM stg.ecommerce_orders GROUP BY status", dw)
+    pedidos_ecom["sistema"] = "ECOMMERCE"
+    df_qtd = pd.concat([pedidos_leg, pedidos_ecom], ignore_index=True)
+    resumo = pd.merge(df_status, df_qtd, on=["status_origem", "sistema"], how="left")
+    
+    print("\nResumo da conformação de status:")
+    print(resumo[["sistema", "status_origem", "status_conformado", "motivo_cancelamento", "qtd_pedidos"]])
+    # Asserções de Qualidade
+    qa.sem_nulos("status_conformado preenchido", df_status["status_conformado"])
+    qa.dominio("status_conformado valido", df_status["status_conformado"], {"ENTREGUE", "CANCELADO", "EM_TRANSITO", "PROCESSAMENTO"})
+    qa.igual("total de regras dim_status", len(df_status), 9)
 
 
 
@@ -364,7 +404,7 @@ def liga_sac_e_avaliacoes(qa):
 if __name__ == "__main__":
     qa = Suite(etapa="02_transformacao")
     unifica_clientes(qa)
-    # conforma_status(qa)
+    conforma_status(qa)
     # conforma_valores(qa)
     # conforma_categorias(qa)
     # trata_datas_e_ausencias(qa)
@@ -376,7 +416,19 @@ if __name__ == "__main__":
     #   · nenhuma junção multiplicou linhas (use qa.cardinalidade_preservada);
     #   · soma de valor_mercadoria por pedido bate com a soma dos itens (±0,01).
 
+    # dim_cliente sem CPF dupplicado dentre os válidos
+    dw = eng_dw()
+    df_cpfs_validos = pd.read_sql("SELECT cpf_normalizado FROM dw.dim_cliente WHERE cpf_valido = true", dw)
+    qa.unico("cpf valido unico em dim_cliente", df_cpfs_validos["cpf_normalizado"])
+
+    status_mapeados = set(pd.read_sql("SELECT status_origem FROM dw.dim_status", dw)["status_origem"])
+    status_pedidos_leg = set(pd.read_sql('SELECT DISTINCT "STATUS" FROM stg.legado_pedidos', dw)["STATUS"])
+    status_pedidos_ecom = set(pd.read_sql("SELECT DISTINCT status FROM stg.ecommerce_orders", dw)["status"])
+    status_sem_regra = (status_pedidos_leg | status_pedidos_ecom) - status_mapeados
+    qa.igual("cobertura total de status dos pedidos", len(status_sem_regra), 0, "todos os status de pedidos devem ter regra mapeada")
+
     qa.registrar(eng_dw())
+
     if qa.imprimir():
         print("Há asserções em falha. Isso não impede seguir, mas precisa "
               "aparecer no RDT com explicação.")
