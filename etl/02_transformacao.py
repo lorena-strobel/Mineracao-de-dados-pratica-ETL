@@ -758,9 +758,9 @@ if __name__ == "__main__":
     qa = Suite(etapa="02_transformacao")
     unifica_clientes(qa)
     conforma_status(qa)
-    # conforma_valores(qa)
-    # conforma_categorias(qa)
-    # trata_datas_e_ausencias(qa)
+    conforma_valores(qa)
+    conforma_categorias(qa)
+    trata_datas_e_ausencias(qa)
     # liga_sac_e_avaliacoes(qa)
 
     # TODO 2.7 — asserções obrigatórias desta etapa:
