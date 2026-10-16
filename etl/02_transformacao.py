@@ -376,8 +376,8 @@ def conforma_valores(qa):
                     'LEGADO' as sistema_origem,
                     p."ID_PEDIDO" as id_pedido_origem,
                     p."ID_CLIENTE" as id_cliente_origem,
-                    p."DT_PEDIDO" as dt_pedido_origem,
-                    p."DT_ENTREGA" as dt_entrega_origem,
+                    (p."DT_PEDIDO" AT TIME ZONE 'America/Sao_Paulo') as dt_pedido_origem,
+                    (CASE WHEN p."DT_ENTREGA" IS NOT NULL THEN p."DT_ENTREGA" AT TIME ZONE 'America/Sao_Paulo' ELSE NULL END) as dt_entrega_origem,
                     p."CANAL" as canal_origem,
                     p."STATUS" as status_origem,
                     COALESCE(i.qtd_itens, 0) as qtd_itens,
@@ -650,7 +650,7 @@ def conforma_categorias(qa):
 # DECISÃO 5 — DATAS, AUSÊNCIAS E SENTINELAS
 # ===========================================================================
 def trata_datas_e_ausencias(qa):
-    print("-> Tratando datas, ausências e sentinelas (Decisão 5 / RDT-08)...", flush=True)
+    print("-> Tratando datas, ausências, sentinelas e fuso horário UTC (Decisão 5 / RDT-08 & RDT-09)...", flush=True)
     dw = eng_dw()
 
     with dw.begin() as conn:
@@ -683,11 +683,16 @@ def trata_datas_e_ausencias(qa):
                 END;
         """))
 
-    # 2. Asserções de qualidade da Decisão 5 (RDT-08)
+    # 2. Asserções de qualidade da Decisão 5 (RDT-08 e RDT-09)
     with dw.connect() as cx:
         df_qa_datas = pd.read_sql("""
             SELECT 
                 COUNT(*) as total_pedidos,
+                SUM(CASE WHEN dt_pedido_conformada IS NULL THEN 1 ELSE 0 END) as nulos_dt_pedido,
+                SUM(CASE WHEN dt_pedido_conformada <= '2025-06-30 23:59:59+00' THEN 1 ELSE 0 END) as pedidos_ate_corte,
+                SUM(CASE WHEN dt_pedido_conformada > '2025-06-30 23:59:59+00' THEN 1 ELSE 0 END) as pedidos_pos_corte,
+                SUM(CASE WHEN sistema_origem = 'LEGADO' AND dt_pedido_conformada <= '2025-06-30 23:59:59+00' THEN 1 ELSE 0 END) as leg_ate_corte,
+                SUM(CASE WHEN sistema_origem = 'ECOM' AND dt_pedido_conformada <= '2025-06-30 23:59:59+00' THEN 1 ELSE 0 END) as ecom_ate_corte,
                 SUM(CASE WHEN flag_entrega_sem_data THEN 1 ELSE 0 END) as sentinela_1900,
                 SUM(CASE WHEN flag_entrega_inconsistente THEN 1 ELSE 0 END) as invertidas_total,
                 SUM(CASE WHEN sistema_origem = 'LEGADO' AND flag_entrega_inconsistente THEN 1 ELSE 0 END) as invertidas_legado,
@@ -701,6 +706,11 @@ def trata_datas_e_ausencias(qa):
         """, cx)
 
     tot_ped = int(df_qa_datas["total_pedidos"].iloc[0])
+    nulos_dt_ped = int(df_qa_datas["nulos_dt_pedido"].iloc[0])
+    ped_ate_corte = int(df_qa_datas["pedidos_ate_corte"].iloc[0])
+    ped_pos_corte = int(df_qa_datas["pedidos_pos_corte"].iloc[0])
+    leg_corte = int(df_qa_datas["leg_ate_corte"].iloc[0])
+    ecom_corte = int(df_qa_datas["ecom_ate_corte"].iloc[0])
     sent_1900 = int(df_qa_datas["sentinela_1900"].iloc[0])
     inv_tot = int(df_qa_datas["invertidas_total"].iloc[0])
     inv_leg = int(df_qa_datas["invertidas_legado"].iloc[0])
@@ -719,6 +729,12 @@ def trata_datas_e_ausencias(qa):
     qa.igual("quantificacao inversao temporal ecom", inv_ecom, 1683, "Exatamente 1.683 pedidos do e-commerce com entrega invertida")
     qa.maior_igual("menor prazo de entrega valido", menor_p, 0.0, "O menor prazo de entrega válido deve ser maior ou igual a zero")
     qa.igual("ausencias estruturais preservadas", status_indev, 0, "Pedidos não entregues não podem possuir data de entrega conformada")
+
+    # Asserções RDT-09 (Padronização Temporal em UTC e Alinhamento do Corte Preditivo)
+    qa.igual("dt_pedido sem nulos", nulos_dt_ped, 0, "100% dos pedidos devem possuir dt_pedido_conformada preenchida")
+    qa.igual("pedidos conformados ate corte utc", ped_ate_corte, 341546, "Exatamente 341.546 pedidos até 2025-06-30 23:59:59 UTC (108.059 legado + 233.487 ecom)")
+    qa.igual("pedidos conformados pos corte utc", ped_pos_corte, 68454, "Exatamente 68.454 pedidos pós corte temporal no DW (21.941 legado + 46.513 ecom)")
+    qa.igual("alinhamento legado ate corte", leg_corte, 108059, "Exatamente 108.059 pedidos do legado até a data de corte UTC (11 pedidos noturnos realocados pós-corte)")
 
 
 

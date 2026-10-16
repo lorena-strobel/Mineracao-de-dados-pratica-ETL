@@ -251,6 +251,42 @@ O perfilamento empírico da base total de 410.000 pedidos (escala 1.0, seed 2026
 - `ausencias estruturais preservadas`: valida 0 entregas conformadas em pedidos não entregues.
 Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 
+### Ficha RDT-09 — Padronização Temporal em UTC entre os Sistemas de Origem
+
+**Decisão:** padronização uniforme de todas as datas e eventos transacionais no tipo canônico `TIMESTAMPTZ` em UTC, interpretando os dados temporais ingênuos (sem fuso horário do ERP Legado e 19,95% do Marketplace) sob o fuso oficial de referência comercial brasileiro (`America/Sao_Paulo` / UTC-3).
+
+**Etapa do pipeline:** 02_transformacao · `conforma_valores` e `trata_datas_e_ausencias`
+
+**O que o dado mostrava:** 
+O perfilamento empírico da base total de 410.000 pedidos e 160.000 avaliações (escala 1.0, seed 20262) revelou três convenções de fuso horário heterogêneas e assimétricas entre os sistemas:
+1. *ERP Legado (130.000 pedidos, 31,71% da base):* Registros em MySQL utilizavam `DATETIME` ingênuo sem fuso horário (ex.: `2025-06-30 21:46:00`), correspondente ao horário local comercial da sede (UTC-3). Na ingestão direta para o PostgreSQL DW cujo fuso de sessão é `Etc/UTC`, o banco assumia implicitamente UTC (+00:00), criando defasagem física artificial de 3 horas em 100% dos pedidos.
+2. *E-commerce (280.000 pedidos, 68,29% da base):* Registros em PostgreSQL utilizavam `TIMESTAMPTZ` nativo gravados com offset `-03` (ex.: `2025-06-30 21:46:00-03`), convertidos automaticamente pelo motor de banco para UTC (`2025-07-01 00:46:00+00`).
+3. *Marketplace (160.000 avaliações):* 128.085 avaliações (80,05%) possuíam fuso explícito `-03:00`, ao passo que 31.915 avaliações (19,95%) apresentavam strings ISO sem fuso (anomalia D11c).
+4. *Fronteira Crítica do Corte Preditivo (`2025-06-30 23:59:59 UTC`):* Na faixa noturna entre 21:00:00 e 23:59:59 horário local de 30/06/2025, foram identificados 11 pedidos no ERP Legado e 37 pedidos no E-commerce. Sem o alinhamento de fuso, os 11 pedidos do legado eram incorretamente retidos na janela de atributos preditivos (até 30/06), enquanto compras virtuais ocorridas no mesmo segundo físico eram alocadas em 01/07 (janela do alvo), violando a causalidade e criando assimetria entre canais.
+
+**Alternativas consideradas:**
+1. *Manter timestamps ingênuos como UTC sem ajuste:* Descartada: gera assimetria de 3 horas entre lojas físicas e virtuais; assume contrafactualmente que os PDVs operavam no Meridiano de Greenwich e causa falso positivo de corte preditivo.
+2. *Converter todas as datas para Horário Local de Brasília (`America/Sao_Paulo` / UTC-3):* Descartada: entra em conflito com as convenções dos contêineres e do PostgreSQL DW (que operam canonicamente em UTC) e dificulta a portabilidade do pipeline analítico.
+3. *Padronizar integralmente em UTC (`TIMESTAMPTZ`), interpretando campos ingênuos sob `America/Sao_Paulo`:* Adotada.
+
+**Decisão:** alternativa 3.
+
+**Justificativa:** Restaura a comparabilidade física e causal absoluta entre todas as transações da organização. Ao aplicar `AT TIME ZONE 'America/Sao_Paulo'` na ingestão do legado e das avaliações do marketplace, garante-se que pedidos realizados simultaneamente em loja física ou e-commerce recebam a mesma marcação temporal canônica em UTC. Protege a partição temporal do corte analítico contra vazamentos sutis de fim de mês.
+
+**O que se perde:** Perde-se a hora visual "de relógio de parede" da loja física na representação atômica da coluna `TIMESTAMPTZ` (uma compra física das 21:46 em Cuiabá passa a constar como 00:46 UTC do dia subsequente). Relatórios operacionais que demandem a hora local civil de fechamento de caixa devem explicitamente projetar `AT TIME ZONE 'America/Sao_Paulo'`.
+
+**Registros afetados:** 
+- 130.000 pedidos do ERP Legado (100,0% da origem; 31,71% do total de 410.000 pedidos do DW) ajustados em +3 horas para UTC.
+- 31.915 avaliações do Marketplace sem fuso (19,95% das avaliações) padronizadas em UTC.
+- 11 pedidos noturnos do legado em 30/06/2025 realocados da janela de atributos para a janela pós-corte UTC (resultando em 108.059 pedidos do legado até o corte e 21.941 pós-corte; 341.546 consolidados até o corte e 68.454 pós-corte).
+
+**Asserção associada:** Etapa 02 (`02_transformacao.py`), asserções:
+- `dt_pedido sem nulos`: valida 0 pedidos com data de pedido nula no DW.
+- `pedidos conformados ate corte utc`: valida contagem exata de 341.546 pedidos conformados até `2025-06-30 23:59:59+00` (108.059 legado + 233.487 e-commerce).
+- `pedidos conformados pos corte utc`: valida contagem exata de 68.454 pedidos pós-corte temporal no DW (21.941 legado + 46.513 e-commerce).
+- `alinhamento legado ate corte`: valida 108.059 pedidos do legado até a data de corte UTC (atestando a realocação das 11 compras noturnas).
+Todas auditadas e registradas na tabela `qa.execucao_assercao`.
+
 ---
 
 ## Tabela-resumo
@@ -265,7 +301,7 @@ Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 | RDT-06 | Truncamento de frete negativo e conversão de sentinela de desconto -1 | 1.174 pedidos (frete) / 4.056 itens (desconto) | 0,29% (pedidos) / 0,29% (itens) | Sim (subsídios de frete de R$ 48.347,51 descartados do frete faturado; inelegibilidade retida em flag) |
 | RDT-07 | Conformação da taxonomia de produtos em 2 níveis e desambiguação léxica | 3.000 produtos (legado) | 20,0% do catálogo | Sim (categoria administrativa do legado sobreposta pela descrição fática; texto bruto retido em categoria_origem) |
 | RDT-08 | Classificação de ausências, anulação de 1900-01-01 e de inversões temporais com flags | 3.483 pedidos (1.025 sentinela 1900 + 2.458 invertidos) | 0,85% da base | Sim (datas reais irrecuperáveis excluídas do cálculo de SLA; rastreabilidade retida em flags) |
-| RDT-09 | Padronização temporal em UTC | | | |
+| RDT-09 | Padronização temporal em UTC e conversão de fontes ingênuas sob Horário de Brasília | 130.000 pedidos (legado) + 31.915 avaliações (marketplace) | 31,7% (pedidos) / 19,9% (avaliações) | Sim (hora visual de relógio de parede nas lojas físicas substituída pelo padrão astronômico UTC; 11 pedidos noturnos de 30/06 alocados em 01/07 UTC) |
 | RDT-10 | Itens órfãos | | | |
 | RDT-11 | Declaração de grão de fato_pedido e fato_item_pedido | | | |
 | RDT-12 | Pedidos sem cliente correspondente | | | |
