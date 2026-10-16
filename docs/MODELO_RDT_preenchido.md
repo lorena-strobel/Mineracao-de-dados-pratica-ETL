@@ -1,6 +1,7 @@
 # Registro de Decisões de Transformação (RDT)
 
 **Equipe:** Mateus de Souza Arruda e Lorena Strobel Campos  **Data:** 14/10/2026  **Versão do pipeline:** 0.2.0
+**Link Github:** https://github.com/lorena-strobel/Mineracao-de-dados-pratica-ETL.git
 
 Este é o artefato central do projeto e vale **30% da nota**. Ele não descreve o
 que o código faz — o código já faz isso. Ele registra **por que** cada decisão
@@ -85,6 +86,129 @@ Ao menos uma ficha para cada decisão abaixo. Mais, se vocês encontrarem outras
 <br>
 
 ## Fichas Preenchidas
+
+### Ficha RDT-01 — Carga completa ou incremental, e com que critério de mudança
+
+**Decisão:** Estratégia de carga da camada de Staging (Carga Completa vs. Carga Incremental).
+
+**Etapa do pipeline:** 01_extracao · `extrai_mysql`, `extrai_postgres`, `extrai_sac`, `extrai_avaliacoes`
+
+**O que o dado mostrava:** As quatro fontes de dados apresentam naturezas heterogêneas. Os arquivos externos (`atendimentos_sac.csv` e `avaliacoes_marketplace.json`) e as tabelas do sistema legado não fornecem campos confiáveis de controle de mutação (como `dt_atualizacao`, log transacional ou Change Data Capture - CDC). Apenas o e-commerce possui timestamps em certas tabelas, mas sem garantia de integridade de deleções/atualizações entre sistemas.
+
+**Alternativas consideradas:**
+1. Carga Incremental: Transferência dos registros novos ou modificados desde a última extração. Descartada por ausência de metadados de modificação confiáveis nas origens (legado e arquivos estáticos), gerando risco de dados desatualizados ou inconsistentes.
+2. Carga Completa (Full Load): Truncar/substituir as tabelas da camada `stg` e recarregar 100% dos dados brutos a cada execução.
+
+**Decisão:** Alternativa 2 (Carga Completa).
+
+**Justificativa:** Assegura a reproducibilidade do ambiente a partir do zero via `docker compose down -v && docker compose up --build`. Garante que o Data Warehouse reflita o estado exato das origens sem dependência de estados residuais ou falhas de sincronização incremental.
+
+**O que se perde:** Eficiência computacional e tempo de execução. O tempo de build/extração consome entre 3 e 5 minutos para processar o volume completo das quatro origens, custo que seria menor em uma abordagem incremental.
+
+**Registros afetados:** 2.205.843 registros (100% do volume das origens: 577.336 do legado, 1.372.367 do e-commerce, 96.140 do SAC e 160.000 avaliações).
+
+**Asserção associada:** Validação da integridade volumétrica e estrutural na etapa 01:
+1. `qa.igual("linhas legado.PEDIDOS", ...)`: Compara a contagem do MySQL com `stg.legado_pedidos` (esperado = 130.000).
+2. `qa.igual("linhas ecommerce.orders", ...)`: Compara a contagem do PostgreSQL com `stg.ecommerce_orders` (esperado = 280.000).
+3. `qa.sem_nulos("protocolo do SAC", ...)`: Assegura ausência de nulos na chave de atendimento.
+4. `qa.unico("review_id", ...)`: Validação de unicidade das avaliações do marketplace.
+
+<br>
+<br>
+
+### Ficha RDT-02 — Regra de unificação de identidade do cliente entre os dois sistemas
+
+**Decisão:** Regra de unificação da identidade do cliente entre o sistema legado e o e-commerce via CPF.
+
+**Etapa do pipeline:** 02_transformacao · `unifica_clientes`
+
+**O que o dado mostrava:** Cerca de 33% dos clientes do legado também existem no e-commerce (~14.850 indivíduos). A única ponte confiável é o CPF. Contudo, ~8% dos CPFs estão ausentes em cada origem e ~9% possuem dígito verificador inválido. O perfilamento revelou que o erro de digitação do CPF inválido foi propagado de forma idêntica para ambos os sistemas, tornando-o um identificador estável.
+
+**Alternativas consideradas:**
+1. Parear exclusivamente CPFs com dígito verificador válido: Descartada, pois descartaria 1.135 pareamentos legítimos (~9% das uniões) de pessoas reais cujo erro de digitação foi propagado igualmente.
+2. Parear por nome normalizado + cidade + UF (para registros sem CPF): Descartada, pois a taxa de falsos positivos varia entre 3% e 5% de falsos positivos, corrompendo a integridade da dimensão.
+3. Parear por CPF limpo de 11 dígitos (válidos e com dígito incorreto propagado), mantendo controle de unicidade e marcando a regra de pareamento aplicada (`CPF_VALIDO` vs `CPF_DIGITO_INVALIDO`).
+
+**Decisão:** Alternativa 3.
+
+**Justificativa:** 
+* *CPF inválido serve para parear?:* Sim. Se possui 11 dígitos e coincide entre os dois sistemas, a probabilidade de colisão aleatória entre duas pessoas distintas é desprezível. Ele identifica o cliente de forma estável.
+* *Parear por nome + cidade + UF?:* Não. A taxa de falso positivo estimada (3% a 5%) é inaceitável.
+* *Qual erro é mais grave?* Fundir dois clientes distintos (falso positivo), pois isso corrompe irremediavelmente o histórico de compras, métricas de LTV e a ABT de recompra. Manter o cliente duplicado fragmenta a visão, mas preserva a veracidade individual de cada registro.
+* *Duplicatas internas do legado:* Foram tratadas previamente retendo o registro mais recente (detalhado na RDT-03).
+
+**O que se perde:** Deixa-se de parear os clientes sobrepostos que não possuem CPF preenchido em uma ou ambas as fontes (~8% de ausência). Estima-se que ~15,1% dos clientes comuns (~2.245 pessoas) não foram unificados e passaram a coexistir como dois clientes distintos no DW, subestimando sua frequência de compra.
+
+**Registros afetados:** 106.937 clientes unificados na `dw.dim_cliente`:
+* `AMBOS`: 11.470 (CPF válido) + 1.135 (dígito inválido) = 12.605 clientes pareados (84,9% da sobreposição total).
+* `ECOM`: 59.705 (válido) + 5.832 (inválido) = 65.537 clientes exclusivos.
+* `LEGADO`: 26.196 (válido) + 2.599 (inválido) = 28.795 clientes exclusivos.
+
+**Asserção associada:** 
+* `qa.sem_nulos("nome_padronizado preenchido", dim_cliente["nome_padronizado"])`: 0 nulos obtidos.
+* `qa.dominio("origem_unificacao valida", dim_cliente["origem_unificacao"], {"LEGADO", "ECOM", "AMBOS"})`.
+* `qa.unico("cpf valido unico em dim_cliente", df_cpfs_validos["cpf_normalizado"])`: 0 duplicados entre os CPFs válidos.
+
+<br>
+<br>
+
+### Ficha RDT-03 — Tratamento das duplicatas internas do legado
+
+**Decisão:** Tratamento e remoção interna de clientes do sistema legado prévia ao cruzamento.
+
+**Etapa do pipeline:** 02_transformacao · `unifica_clientes`
+
+**O que o dado mostrava:** A tabela `CLIENTES` do legado continha 47.250 registros para 41.400 CPFs distintos. Havia 5.849 registros duplicados de CPF (12,38% da base), decorrentes de duplicatas exatas (~2%) e recadastros operacionais com inconsistências de máscara/espaços (~3%).
+
+**Alternativas consideradas:**
+1. Manter todas as duplicatas: Descartada, pois a cardinalidade no cruzamento (JOIN) com o e-commerce geraria produto cartesiano e multiplicaria indevidamente as linhas na `dim_cliente`.
+2. Descartar todos os CPFs com duplicidade: Descartada, pois eliminaria sumariamente clientes ativos e legítimos da empresa.
+3. Ordenar os registros decrescentemente por data de cadastro (`dt_cadastro DESC`) e reter a primeira ocorrência (mais recente), consolidando o Golden Record cadastral.
+
+**Decisão:** Alternativa 3.
+
+**Justificativa:** Garante a unicidade da chave natural no legado antes do merge com o e-commerce e assegura que os atributos cadastrais preservados (endereço, telefone, grafia de nome) correspondam à versão mais atualizada fornecida pelo cliente.
+
+**O que se perde:** O histórico cadastral anterior associado aos registros antigos descartados (mudanças pretéritas de endereço ou telefone). Caso os pedidos legados utilizassem o `id_cliente` antigo descartado, a reconciliação precisa ser garantida via chave de negócio (CPF) no DW.
+
+**Registros afetados:** 5.849 registros duplicados expurgados (12,38% das 47.250 linhas do legado).
+
+**Asserção associada:** 
+* `qa.unico("cpf valido unico em dim_cliente", ...)`: Verificação de 0 duplicatas de CPF na dimensão final.
+* `qa.cardinalidade_preservada`: Garantia de que a junção não gerou explosão de linhas.
+
+<br>
+<br>
+
+### Ficha RDT-04 — Conformação de `STATUS` × `status`, incluindo `payment_declined`
+
+**Decisão:** Conformação dos status de pedido entre Legado e E-commerce, preservando a distinção de recusa de pagamento.
+
+**Etapa do pipeline:** 02_transformacao · `conforma_status`
+
+**O que o dado mostrava:** O legado agregava sob o rótulo `CANCELADO` um total de 15.774 pedidos sem detalhar o motivo. Já o e-commerce possuía 36.403 pedidos não concluídos, distinguindo desistência do cliente (`canceled`, 22.413 pedidos) e falha técnica/financeira (`payment_declined`, 13.990 pedidos). Havia ainda divergências na nomenclatura dos demais status (`ENTREGUE`/`delivered`, `EM TRANSITO`/`shipped`, `SEPARACAO`/`processing`).
+
+**Alternativas consideradas:**
+1. Mapear `payment_declined` para `CANCELADO` de forma plana: Descartada, pois destrói uma métrica de negócio crucial sobre perdas por antifraude/gateway de pagamento.
+2. Criar status planos separados (`CANCELADO_CLIENTE` e `CANCELADO_PAGAMENTO`): Descartada, pois introduz assimetria forçada onde o legado ficaria sempre órfão ou classificado como "indefinido", complicando agregações gerenciais de cancelamento global.
+3. Modelagem hierárquica na dimensão: Definir `status_conformado = 'CANCELADO'` para ambos os fluxos e criar o atributo complementar `motivo_cancelamento`, preenchido como `'DESISTENCIA_CLIENTE'`, `'RECUSA_PAGAMENTO'` ou `NULL` (quando desconhecido no legado).
+
+**Decisão:** Alternativa 3.
+
+**Justificativa:** Atende perfeitamente ao esquema relacional da `dw.dim_status`, unificando a visão gerencial de pedidos cancelados sem descartar a granularidade e a riqueza analítica existente na origem do e-commerce.
+
+**O que se perde:** O motivo de cancelamento dos 15.774 pedidos do legado permanece desconhecido e irrecuperável (`NULL`), gerando uma assimetria analítica que impede o uso homogêneo do atributo de recusa de pagamento para clientes exclusivos do legado na modelagem da ABT.
+
+**Registros afetados:** 100% dos pedidos de ambas as origens (130.000 do legado e 280.000 do e-commerce), abrangendo as 9 regras conformadas na `dw.dim_status`. No detalhe dos cancelamentos: 15.774 pedidos do legado e 36.403 do e-commerce (22.413 por desistência e 13.990 por recusa de pagamento).
+
+**Asserção associada:** 
+* `qa.sem_nulos("status_conformado preenchido", ...)`: 0 nulos (esperado = 0).
+* `qa.dominio("status_conformado valido", ..., {"ENTREGUE", "CANCELADO", "EM_TRANSITO", "PROCESSAMENTO"})`: 0 violações.
+* `qa.igual("total de regras dim_status", len(df_status), 9)`: Exatamente 9 regras mapeadas.
+* `qa.igual("cobertura total de status dos pedidos", len(status_sem_regra), 0)`: 100% dos status brutos cobertos sem órfãos.
+
+<br>
+<br>
 
 ### Ficha RDT-05 — Definição e Decomposição Contábil de VALOR_TOTAL e total_amount
 
