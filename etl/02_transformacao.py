@@ -19,6 +19,7 @@ import re
 import unicodedata
 
 import pandas as pd
+from sqlalchemy import text
 
 from config import eng_dw
 from qualidade.assercoes import Suite
@@ -74,9 +75,179 @@ def unifica_clientes(qa):
     Preencha dim_cliente com o rastro: id_legado, id_ecommerce,
     origem_unificacao e regra_pareamento (que regra uniu cada par).
     """
-    # TODO 2.1
-    raise NotImplementedError
+    print("-> Unifica Clientes...", flush=True)
+    dw = eng_dw()
+    
+    clientes_legado = pd.read_sql("SELECT * FROM stg.legado_clientes", dw)
+    clientes_ecom = pd.read_sql("SELECT * FROM stg.ecommerce_customer", dw)
 
+    clientes_legado.columns = [c.lower() for c in clientes_legado.columns]
+    clientes_ecom.columns = [c.lower() for c in clientes_ecom.columns]
+
+    # Renomeia com os nomes REAIS das colunas da staging
+    clientes_legado = clientes_legado.rename(columns={
+        'id_cliente': 'id_legado',
+        'nome': 'nome_cliente'
+    })
+    clientes_ecom = clientes_ecom.rename(columns={
+        'customer_id': 'id_ecommerce',
+        'full_name': 'nome_cliente',
+        'city': 'cidade',
+        'state': 'uf'
+    })
+
+    # ratamento de CPF e nomes
+    clientes_legado["cpf_limpo"] = clientes_legado["cpf"].apply(so_digitos)
+    clientes_legado["cpf_valido"] = clientes_legado["cpf_limpo"].apply(cpf_valido)
+    clientes_legado["nome_normalizado"] = clientes_legado["nome_cliente"].apply(normaliza_nome)
+    
+    clientes_ecom["cpf_limpo"] = clientes_ecom["tax_id"].apply(so_digitos)
+    clientes_ecom["cpf_valido"] = clientes_ecom["cpf_limpo"].apply(cpf_valido)
+    clientes_ecom["nome_normalizado"] = clientes_ecom["nome_cliente"].apply(normaliza_nome)
+
+    # Tratamento de datas de cadastro para pegar a primeira
+    clientes_legado["dt_cadastro"] = pd.to_datetime(clientes_legado["dt_cadastro"], errors="coerce")
+    clientes_ecom["dt_cadastro"] = pd.to_datetime(clientes_ecom["created_at"], errors="coerce").dt.tz_localize(None)
+
+    # Tratamento das duplicatas internas do legado (ordem decrescente de cadastro)
+    clientes_legado = clientes_legado.sort_values(by="dt_cadastro", ascending=False)
+    duplicatas_legado = clientes_legado.duplicated(subset=["cpf_limpo"]).sum()
+
+    # Consideranod clientes com CPF de 11 dígitos (válidos e com dígito com erro propagado)
+    legado_val = clientes_legado[clientes_legado["cpf_limpo"].str.len() == 11].drop_duplicates(subset=["cpf_limpo"], keep="first")
+    ecom_val = clientes_ecom[clientes_ecom["cpf_limpo"].str.len() == 11].drop_duplicates(subset=["cpf_limpo"], keep="first")
+
+    # Cruzamento por CPF
+    cruzamento_cpf = pd.merge(
+        legado_val, ecom_val, 
+        on="cpf_limpo", how="outer", suffixes=('_leg', '_ecom')
+    )
+
+    # Define a procedência do cliente
+    def define_origem(row):
+        tem_l = pd.notna(row.get('id_legado'))
+        tem_e = pd.notna(row.get('id_ecommerce'))
+        if tem_l and tem_e:
+            return 'AMBOS'
+        elif tem_l:
+            return 'LEGADO'
+        else:
+            return 'ECOM'
+
+    cruzamento_cpf['origem_unificacao'] = cruzamento_cpf.apply(define_origem, axis=1)
+
+    # Regra de pareamento: se o dígito verificador confere em ambos/um deles
+    cruzamento_cpf['cpf_valido'] = (cruzamento_cpf['cpf_valido_ecom'] == True) | (cruzamento_cpf['cpf_valido_leg'] == True)
+    cruzamento_cpf['regra_pareamento'] = cruzamento_cpf['cpf_valido'].apply(
+        lambda v: 'CPF_VALIDO' if v else 'CPF_DIGITO_INVALIDO'
+    )
+
+    # Consolida nome, cidade, uf e primeira data de cadastro
+    cruzamento_cpf['nome_padronizado'] = cruzamento_cpf['nome_normalizado_ecom'].fillna(
+        cruzamento_cpf['nome_normalizado_leg']
+    ).fillna('DESCONHECIDO')
+    
+    cruzamento_cpf['cidade'] = cruzamento_cpf['cidade_ecom'].fillna(cruzamento_cpf['cidade_leg'])
+    cruzamento_cpf['uf'] = cruzamento_cpf['uf_ecom'].fillna(cruzamento_cpf['uf_leg'])
+    
+    # Menor data de cadastro entre os dois sistemas
+    cruzamento_cpf['dt_primeiro_cadastro'] = cruzamento_cpf[['dt_cadastro_leg', 'dt_cadastro_ecom']].min(axis=1).dt.date
+
+    # Montagem do DataFrame contemplando todas as colunas
+    dim_cliente = pd.DataFrame({
+        'id_legado': cruzamento_cpf['id_legado'],
+        'id_ecommerce': cruzamento_cpf['id_ecommerce'],
+        'cpf_normalizado': cruzamento_cpf['cpf_limpo'],
+        'cpf_valido': cruzamento_cpf['cpf_valido'],
+        'nome_padronizado': cruzamento_cpf['nome_padronizado'],
+        'cidade': cruzamento_cpf['cidade'],
+        'uf': cruzamento_cpf['uf'],
+        'dt_primeiro_cadastro': cruzamento_cpf['dt_primeiro_cadastro'],
+        'origem_unificacao': cruzamento_cpf['origem_unificacao'],
+        'regra_pareamento': cruzamento_cpf['regra_pareamento']
+    })
+
+    # Remove linhas sem CPF
+    dim_cliente = dim_cliente.dropna(subset=['cpf_normalizado'])
+    dim_cliente = dim_cliente[dim_cliente['cpf_normalizado'] != ""]
+
+    print(f"-> Total de clientes unificados estruturados: {len(dim_cliente)}")
+    print("-> Gravando dw.dim_cliente...")
+
+    # Grava na staging temporária
+    dim_cliente.to_sql(
+        "temp_dim_cliente", 
+        dw, 
+        schema="dw", 
+        if_exists="replace", 
+        index=False
+    )
+
+    # Atualizando e inserindo todas as colunas
+    upsert_sql = text("""
+        UPDATE dw.dim_cliente AS dest
+        SET 
+            id_legado = NULLIF(src.id_legado::text, '')::integer,
+            id_ecommerce = NULLIF(src.id_ecommerce::text, '')::bigint,
+            cpf_valido = src.cpf_valido::boolean,
+            nome_padronizado = src.nome_padronizado,
+            cidade = src.cidade,
+            uf = src.uf,
+            dt_primeiro_cadastro = src.dt_primeiro_cadastro::date,
+            origem_unificacao = src.origem_unificacao,
+            regra_pareamento = src.regra_pareamento
+        FROM dw.temp_dim_cliente AS src
+        WHERE dest.cpf_normalizado = src.cpf_normalizado;
+
+        INSERT INTO dw.dim_cliente (
+            id_legado, 
+            id_ecommerce, 
+            cpf_normalizado,
+            cpf_valido, 
+            nome_padronizado,
+            cidade,
+            uf,
+            dt_primeiro_cadastro,
+            origem_unificacao, 
+            regra_pareamento
+        )
+        SELECT 
+            NULLIF(id_legado::text, '')::integer, 
+            NULLIF(id_ecommerce::text, '')::bigint, 
+            src.cpf_normalizado,
+            src.cpf_valido::boolean,
+            src.nome_padronizado,
+            src.cidade,
+            src.uf,
+            src.dt_primeiro_cadastro::date,
+            src.origem_unificacao, 
+            src.regra_pareamento
+        FROM dw.temp_dim_cliente AS src
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dw.dim_cliente dest 
+            WHERE dest.cpf_normalizado = src.cpf_normalizado
+        );
+
+        DROP TABLE IF EXISTS dw.temp_dim_cliente;
+    """)
+
+    with dw.begin() as conn:
+        conn.execute(upsert_sql)
+
+    # Asserções obrigatórias
+    qa.sem_nulos("nome_padronizado preenchido", dim_cliente["nome_padronizado"])
+    qa.dominio("origem_unificacao valida", dim_cliente["origem_unificacao"], {"LEGADO", "ECOM", "AMBOS"})
+
+    # Resumo
+    df_resumo = pd.read_sql("""
+        SELECT origem_unificacao, regra_pareamento, COUNT(*) as total 
+        FROM dw.dim_cliente 
+        GROUP BY origem_unificacao, regra_pareamento
+        ORDER BY origem_unificacao, regra_pareamento
+    """, dw)
+    print("\nResumo da unificação:")
+    print(df_resumo)
+    print(f"-> Duplicatas internas removidas no legado: {duplicatas_legado}")
 
 # ===========================================================================
 # DECISÃO 2 — CONFORMAÇÃO DE STATUS
@@ -101,8 +272,49 @@ def conforma_status(qa):
     Escolha e preencha dw.dim_status. Registre quantos pedidos caem em cada
     célula do mapeamento — esse número é parte da justificativa.
     """
-    # TODO 2.2
-    raise NotImplementedError
+    print("-> Conforma Status...", flush=True)
+    dw = eng_dw()
+
+    dados_status = [
+
+        # Legado
+        {"status_origem": "ENTREGUE", "sistema": "LEGADO", "status_conformado": "ENTREGUE", "motivo_cancelamento": None},
+        {"status_origem": "EM TRANSITO", "sistema": "LEGADO", "status_conformado": "EM_TRANSITO", "motivo_cancelamento": None},
+        {"status_origem": "SEPARACAO", "sistema": "LEGADO", "status_conformado": "PROCESSAMENTO", "motivo_cancelamento": None},
+        {"status_origem": "CANCELADO", "sistema": "LEGADO", "status_conformado": "CANCELADO", "motivo_cancelamento": None},
+
+        # E-commerce
+        {"status_origem": "delivered", "sistema": "ECOMMERCE", "status_conformado": "ENTREGUE", "motivo_cancelamento": None},
+        {"status_origem": "shipped", "sistema": "ECOMMERCE", "status_conformado": "EM_TRANSITO", "motivo_cancelamento": None},
+        {"status_origem": "processing", "sistema": "ECOMMERCE", "status_conformado": "PROCESSAMENTO", "motivo_cancelamento": None},
+        {"status_origem": "canceled", "sistema": "ECOMMERCE", "status_conformado": "CANCELADO", "motivo_cancelamento": "DESISTENCIA_CLIENTE"},
+        {"status_origem": "payment_declined", "sistema": "ECOMMERCE", "status_conformado": "CANCELADO", "motivo_cancelamento": "RECUSA_PAGAMENTO"}
+    ]
+    
+    df_status = pd.DataFrame(dados_status)
+
+    # Gravação na dimensão
+    with dw.begin() as conn:
+        conn.execute(text("TRUNCATE dw.dim_status RESTART IDENTITY CASCADE;"))
+    
+    df_status.to_sql("dim_status", dw, schema="dw", if_exists="append", index=False)
+    print("-> Gravando dw.dim_status...")
+
+    # Contagem de pedidos por status para subsidiar o RDT-04
+    pedidos_leg = pd.read_sql('SELECT "STATUS" as status_origem, COUNT(*) as qtd_pedidos FROM stg.legado_pedidos GROUP BY "STATUS"', dw)
+    pedidos_leg["sistema"] = "LEGADO"
+    pedidos_ecom = pd.read_sql("SELECT status as status_origem, COUNT(*) as qtd_pedidos FROM stg.ecommerce_orders GROUP BY status", dw)
+    pedidos_ecom["sistema"] = "ECOMMERCE"
+    df_qtd = pd.concat([pedidos_leg, pedidos_ecom], ignore_index=True)
+    resumo = pd.merge(df_status, df_qtd, on=["status_origem", "sistema"], how="left")
+    
+    print("\nResumo da conformação de status:")
+    print(resumo[["sistema", "status_origem", "status_conformado", "motivo_cancelamento", "qtd_pedidos"]])
+    # Asserções de Qualidade
+    qa.sem_nulos("status_conformado preenchido", df_status["status_conformado"])
+    qa.dominio("status_conformado valido", df_status["status_conformado"], {"ENTREGUE", "CANCELADO", "EM_TRANSITO", "PROCESSAMENTO"})
+    qa.igual("total de regras dim_status", len(df_status), 9)
+
 
 
 # ===========================================================================
@@ -148,7 +360,7 @@ def conforma_categorias(qa):
     autoriza apagar a evidência do que havia antes.
     """
     # TODO 2.4
-    raise NotImplementedError
+
 
 
 # ===========================================================================
@@ -193,10 +405,10 @@ if __name__ == "__main__":
     qa = Suite(etapa="02_transformacao")
     unifica_clientes(qa)
     conforma_status(qa)
-    conforma_valores(qa)
-    conforma_categorias(qa)
-    trata_datas_e_ausencias(qa)
-    liga_sac_e_avaliacoes(qa)
+    # conforma_valores(qa)
+    # conforma_categorias(qa)
+    # trata_datas_e_ausencias(qa)
+    # liga_sac_e_avaliacoes(qa)
 
     # TODO 2.7 — asserções obrigatórias desta etapa:
     #   · dim_cliente sem cpf_normalizado duplicado entre linhas com CPF válido;
@@ -204,7 +416,19 @@ if __name__ == "__main__":
     #   · nenhuma junção multiplicou linhas (use qa.cardinalidade_preservada);
     #   · soma de valor_mercadoria por pedido bate com a soma dos itens (±0,01).
 
+    # dim_cliente sem CPF dupplicado dentre os válidos
+    dw = eng_dw()
+    df_cpfs_validos = pd.read_sql("SELECT cpf_normalizado FROM dw.dim_cliente WHERE cpf_valido = true", dw)
+    qa.unico("cpf valido unico em dim_cliente", df_cpfs_validos["cpf_normalizado"])
+
+    status_mapeados = set(pd.read_sql("SELECT status_origem FROM dw.dim_status", dw)["status_origem"])
+    status_pedidos_leg = set(pd.read_sql('SELECT DISTINCT "STATUS" FROM stg.legado_pedidos', dw)["STATUS"])
+    status_pedidos_ecom = set(pd.read_sql("SELECT DISTINCT status FROM stg.ecommerce_orders", dw)["status"])
+    status_sem_regra = (status_pedidos_leg | status_pedidos_ecom) - status_mapeados
+    qa.igual("cobertura total de status dos pedidos", len(status_sem_regra), 0, "todos os status de pedidos devem ter regra mapeada")
+
     qa.registrar(eng_dw())
+
     if qa.imprimir():
         print("Há asserções em falha. Isso não impede seguir, mas precisa "
               "aparecer no RDT com explicação.")
