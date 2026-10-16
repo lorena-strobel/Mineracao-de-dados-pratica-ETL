@@ -78,7 +78,11 @@ Ao menos uma ficha para cada decisão abaixo. Mais, se vocês encontrarem outras
 | RDT-14 | Desenho dos atributos da ABT e verificação de ausência de vazamento | 04 |
 | RDT-15 | Vazamentos introduzidos deliberadamente na versão de comparação | 04 |
 
+<br>
+
 ---
+
+<br>
 
 ## Fichas Preenchidas
 
@@ -90,8 +94,8 @@ Ao menos uma ficha para cada decisão abaixo. Mais, se vocês encontrarem outras
 
 **O que o dado mostrava:** 
 Na exploração da base na escala 1.0 (seed 20262), totalizando 410.000 pedidos (130.000 do legado e 280.000 do e-commerce), a apuração da relação algébrica entre os valores declarados no cabeçalho dos pedidos e os respectivos itens comprovou divergência semântica crítica de 100%:
-1. No ERP Legado, a hipótese contábil $H_1: \text{VALOR\_TOTAL} = \sum (\text{VL\_UNITARIO} \times \text{QTD} - \text{VL\_DESCONTO}) + \text{VALOR\_FRETE}$ cumpriu-se exatamente com desvio zero para 130.000 de 130.000 pedidos (100,00%), após o tratamento do sentinela de desconto `-1` (presente em 4.056 itens de 4.003 pedidos). Provou-se que `VALOR_TOTAL` no legado é o **valor faturado bruto final com o frete embutido**.
-2. No E-commerce, a hipótese contábil $H_2: \text{total\_amount} = \sum (\text{unit\_price} \times \text{quantity} - \text{discount})$ cumpriu-se exatamente com desvio zero para 280.000 de 280.000 pedidos (100,00%). O valor do frete (`freight_amount`) reside isolado e **não integra** `total_amount`. Provou-se que `total_amount` no e-commerce é o **subtotal líquido dos produtos sem frete**.
+1. No ERP Legado, a hipótese contábil $H_1: \text{VALOR}_{\text{TOTAL}} = \sum (\text{VL}_{\text{UNITARIO}} \times \text{QTD} - \text{VL}_{\text{DESCONTO}}) + \text{VALOR}_{\text{FRETE}}$ cumpriu-se exatamente com desvio zero para 130.000 de 130.000 pedidos (100,00%), após o tratamento do sentinela de desconto `-1` (presente em 4.056 itens de 4.003 pedidos). Provou-se que `VALOR_TOTAL` no legado é o **valor faturado bruto final com o frete embutido**.
+2. No E-commerce, a hipótese contábil $H_2: \text{total}_{\text{amount}} = \sum (\text{unit}_{\text{price}} \times \text{quantity} - \text{discount})$ cumpriu-se exatamente com desvio zero para 280.000 de 280.000 pedidos (100,00%). O valor do frete (`freight_amount`) reside isolado e **não integra** `total_amount`. Provou-se que `total_amount` no e-commerce é o **subtotal líquido dos produtos sem frete**.
 
 Se integrados diretamente sem conformação, ocorreria contaminação semântica severa: a unificação direta 1:1 subestimaria o faturamento corporativo em 280.000 pedidos (68,29% da base) no montante total de frete contratado (R$ 11.493.447,21 no e-commerce), ou, se somado frete cegamente a ambos os sistemas, computaria o frete em duplicidade em 130.000 pedidos (31,71% da base), inflacionando ficticiamente a receita do legado em R$ 5.307.593,25.
 
@@ -100,10 +104,10 @@ Se integrados diretamente sem conformação, ocorreria contaminação semântica
 1. *Ingestão literal direta (Mapeamento 1:1 ingênuo):* Mapear `VALOR_TOTAL` e `total_amount` diretamente para a medida `valor_total` em `dw.fato_pedido`. Descartada: gera heterogeneidade semântica não resolvida no Data Warehouse; o mesmo atributo dimensional conteria frete para pedidos físicos e excluiria frete para pedidos virtuais, invalidando qualquer análise de faturamento consolidado ou ticket médio.
 2. *Segregação colunar por canal de origem:* Criar medidas distintas como `valor_total_legado` e `total_amount_ecommerce` na tabela fato, mantendo nulo o campo do canal ausente. Descartada: viola os princípios de Kimball de esquema dimensional único ("single source of truth"). Forçaria analistas e ferramentas analíticas (SQL, BI, Python) a utilizarem estruturas condicionais complexas (`COALESCE`), transferindo a complexidade de integração para o usuário final.
 3. *Decomposição canônica de Kimball em quatro medidas aditivas:* Desconstruir e padronizar os valores de todos os 410.000 pedidos em quatro métricas atômicas universais:
-   - `valor_mercadoria` = $\sum (\text{preco\_unitario} \times \text{quantidade})$
+   - `valor_mercadoria` = $\sum (\text{preco}_{\text{unitario}} \times \text{quantidade})$
    - `valor_frete` = frete explicitado e corrigido de valores negativos
    - `valor_desconto` = descontos monetários reais calculados a partir dos itens
-   - `valor_total` = $\text{valor\_mercadoria} + \text{valor\_frete} - \text{valor\_desconto}$
+   - `valor_total` = $\text{valor}_{\text{mercadoria}} + \text{valor}_{\text{frete}} - \text{valor}_{\text{desconto}}$
 
 **Decisão:** alternativa 3.
 
@@ -114,9 +118,12 @@ Se integrados diretamente sem conformação, ocorreria contaminação semântica
 **Registros afetados:** 410.000 pedidos (100,00% da base consolidada: 130.000 do legado [31,71%] e 280.000 do e-commerce [68,29%]), além de 1.392.453 itens vinculados e normalizados.
 
 **Asserção associada:** Etapa 02 (`02_transformacao.py`), asserções:
-- `identidade contábil valor_total`: validação de que $|\text{valor\_total} - (\text{valor\_mercadoria} + \text{valor\_frete} - \text{valor\_desconto})| \le 0,01$ para todos os 410.000 pedidos. Resultado: 410.000 aprovados (0 divergências).
+- `identidade contábil valor_total`: validação de que $|\text{valor}_{\text{total}} - (\text{valor}_{\text{mercadoria}} + \text{valor}_{\text{frete}} - \text{valor}_{\text{desconto}})| \le 0,01$ para todos os 410.000 pedidos. Resultado: 410.000 aprovados (0 divergências).
 - `soma de mercadoria bate com itens`: validação de que a soma de `valor_mercadoria` nos pedidos coincide exatamente com a soma de `valor_bruto` nas linhas de itens. Resultado: 410.000 aprovados (0 divergências).
 Resultados auditados e persistidos na tabela `qa.execucao_assercao`.
+
+<br>
+<br>
 
 ### Ficha RDT-06 — Tratamento de Frete Negativo e Desconto Sentinela `-1`
 
@@ -134,7 +141,7 @@ A inspeção da base consolidada em escala 1.0 (seed 20262) revelou duas anomali
 *Para Frete Negativo:*
 1. *Manter valores negativos brutos:* Descartada: gera custos de transporte negativos nos cubos OLAP do DW, distorcendo relatórios de despesas logísticas por transportadora e médias de frete por UF.
 2. *Inverter o sinal (`ABS(frete)`):* Descartada: arbitrária e contrafactual. A reconciliação do legado provou que o valor foi abatido e não cobrado a mais do cliente; inverter o sinal computaria cobrança indevida.
-3. *Truncar em `0.00` e registrar indicador de anomalia (`flag_frete_negativo`):* Estabelecer $\text{valor\_frete} = \max(0, \text{frete})$ e sinalizar a ocorrência com booleano.
+3. *Truncar em `0.00` e registrar indicador de anomalia (`flag_frete_negativo`):* Estabelecer $\text{valor}_{\text{frete}} = \max(0, \text{frete})$ e sinalizar a ocorrência com booleano.
 
 *Para Desconto Sentinela `-1`:*
 1. *Cálculo literal aritmético (-R$ 1,00):* Descartada: gera ganho fictício de receita líquida de R$ 1,00 por item.
@@ -163,6 +170,9 @@ A inspeção da base consolidada em escala 1.0 (seed 20262) revelou duas anomali
 - `quantificacao desconto sentinela itens`: valida 4.056 itens com `flag_desconto_sentinela = TRUE`.
 - `quantificacao desconto sentinela pedidos`: valida 4.003 pedidos com `flag_desconto_sentinela = TRUE`.
 Todas auditadas e registradas na tabela `qa.execucao_assercao`.
+
+<br>
+<br>
 
 ### Ficha RDT-07 — Mapeamento e Taxonomia de Categorias de Produto
 
@@ -204,6 +214,9 @@ Entretanto, o perfilamento fático revelou que **100,00% dos 3.000 produtos do l
 - `categoria_origem preservada`: valida 100% dos produtos com rastreabilidade da evidência original.
 - `taxonomia conforme ecommerce`: valida se todos os pares `(categoria_nivel1, categoria_nivel2)` do legado existem na taxonomia do e-commerce (0 pares inválidos).
 Todas aprovadas e persistidas na tabela `qa.execucao_assercao`.
+
+<br>
+<br>
 
 ### Ficha RDT-08 — Classificação de Ausências, Sentinela 1900-01-01 e Inversão Temporal
 
@@ -251,6 +264,9 @@ O perfilamento empírico da base total de 410.000 pedidos (escala 1.0, seed 2026
 - `ausencias estruturais preservadas`: valida 0 entregas conformadas em pedidos não entregues.
 Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 
+<br>
+<br>
+
 ### Ficha RDT-09 — Padronização Temporal em UTC entre os Sistemas de Origem
 
 **Decisão:** padronização uniforme de todas as datas e eventos transacionais no tipo canônico `TIMESTAMPTZ` em UTC, interpretando os dados temporais ingênuos (sem fuso horário do ERP Legado e 19,95% do Marketplace) sob o fuso oficial de referência comercial brasileiro (`America/Sao_Paulo` / UTC-3).
@@ -287,7 +303,11 @@ O perfilamento empírico da base total de 410.000 pedidos e 160.000 avaliações
 - `alinhamento legado ate corte`: valida 108.059 pedidos do legado até a data de corte UTC (atestando a realocação das 11 compras noturnas).
 Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 
+<br>
+
 ---
+
+<br>
 
 ## Tabela-resumo
 
