@@ -94,10 +94,10 @@ Ao menos uma ficha para cada decisão abaixo. Mais, se vocês encontrarem outras
 
 **O que o dado mostrava:** 
 Na exploração da base na escala 1.0 (seed 20262), totalizando 410.000 pedidos (130.000 do legado e 280.000 do e-commerce), a apuração da relação algébrica entre os valores declarados no cabeçalho dos pedidos e os respectivos itens comprovou divergência semântica crítica de 100%:
-1. No ERP Legado, a hipótese contábil $H_1: \text{VALOR}_{\text{TOTAL}} = \sum (\text{VL}_{\text{UNITARIO}} \times \text{QTD} - \text{VL}_{\text{DESCONTO}}) + \text{VALOR}_{\text{FRETE}}$ cumpriu-se exatamente com desvio zero para 130.000 de 130.000 pedidos (100,00%), após o tratamento do sentinela de desconto `-1` (presente em 4.056 itens de 4.003 pedidos). Provou-se que `VALOR_TOTAL` no legado é o **valor faturado bruto final com o frete embutido**.
-2. No E-commerce, a hipótese contábil $H_2: \text{total}_{\text{amount}} = \sum (\text{unit}_{\text{price}} \times \text{quantity} - \text{discount})$ cumpriu-se exatamente com desvio zero para 280.000 de 280.000 pedidos (100,00%). O valor do frete (`freight_amount`) reside isolado e **não integra** `total_amount`. Provou-se que `total_amount` no e-commerce é o **subtotal líquido dos produtos sem frete**.
+1. No ERP Legado, a hipótese contábil $H_{1}: \text{VALOR}{\text{TOTAL}} = \sum (\text{VL}{\text{UNITARIO}} \times \text{QTD} - \text{VL}{\text{DESCONTO}}) + \text{VALOR}{\text{FRETE}}$ cumpriu-se exatamente com desvio zero para 130.000 de 130.000 pedidos (100,00%), após o tratamento do sentinela de desconto `-1` (presente em 4.056 itens de 4.003 pedidos). Provou-se que `VALOR_TOTAL` no legado é o **valor faturado bruto final com o frete embutido**.
+2. No E-commerce, a hipótese contábil $H_{2}: \text{total}{\text{amount}} = \sum (\text{unit}{\text{price}} \times \text{quantity} - \text{discount})$ cumpriu-se exatamente com desvio zero para 280.000 de 280.000 pedidos (100,00%). O valor do frete (`freight_amount`) reside isolado e **não integra** `total_amount`. Provou-se que `total_amount` no e-commerce é o **subtotal líquido dos produtos sem frete**.
 
-Se integrados diretamente sem conformação, ocorreria contaminação semântica severa: a unificação direta 1:1 subestimaria o faturamento corporativo em 280.000 pedidos (68,29% da base) no montante total de frete contratado (R$ 11.493.447,21 no e-commerce), ou, se somado frete cegamente a ambos os sistemas, computaria o frete em duplicidade em 130.000 pedidos (31,71% da base), inflacionando ficticiamente a receita do legado em R$ 5.307.593,25.
+Se integrados diretamente sem conformação, ocorreria contaminação semântica severa: a unificação direta 1:1 subestimaria o faturamento corporativo em 280.000 pedidos (68,29% da base) no montante total de frete contratado (R$ 11.493.447,21 no e-commerce), ou, se somado frete cegamente a ambos os sistemas, computaria o frete em duplicidade em $130.000$ pedidos ($31,71%$ da base), inflacionando ficticiamente a receita do legado em R$ 5.307.593,25.
 
 **Alternativas consideradas:**
 
@@ -107,7 +107,7 @@ Se integrados diretamente sem conformação, ocorreria contaminação semântica
    - `valor_mercadoria` = $\sum (\text{preco}_{\text{unitario}} \times \text{quantidade})$
    - `valor_frete` = frete explicitado e corrigido de valores negativos
    - `valor_desconto` = descontos monetários reais calculados a partir dos itens
-   - `valor_total` = $\text{valor}_{\text{mercadoria}} + \text{valor}_{\text{frete}} - \text{valor}_{\text{desconto}}$
+   - `valor_total` = $\text{valor}{\text{mercadoria}} + \text{valor}{\text{frete}} - \text{valor}{\text{desconto}}$
 
 **Decisão:** alternativa 3.
 
@@ -118,8 +118,8 @@ Se integrados diretamente sem conformação, ocorreria contaminação semântica
 **Registros afetados:** 410.000 pedidos (100,00% da base consolidada: 130.000 do legado [31,71%] e 280.000 do e-commerce [68,29%]), além de 1.392.453 itens vinculados e normalizados.
 
 **Asserção associada:** Etapa 02 (`02_transformacao.py`), asserções:
-- `identidade contábil valor_total`: validação de que $|\text{valor}_{\text{total}} - (\text{valor}_{\text{mercadoria}} + \text{valor}_{\text{frete}} - \text{valor}_{\text{desconto}})| \le 0,01$ para todos os 410.000 pedidos. Resultado: 410.000 aprovados (0 divergências).
-- `soma de mercadoria bate com itens`: validação de que a soma de `valor_mercadoria` nos pedidos coincide exatamente com a soma de `valor_bruto` nas linhas de itens. Resultado: 410.000 aprovados (0 divergências).
+- `identidade contábil valor_total`: validação de que $|\text{valor}{\text{total}} - (\text{valor}{\text{mercadoria}} + \text{valor}{\text{frete}} - \text{valor}_{\text{desconto}})| \le 0,01$ para todos os $410.000$ pedidos. Resultado: $410.000$ aprovados ($0$ divergências).
+- `soma de mercadoria bate com itens`: validação de que a soma de `valor_mercadoria` nos pedidos coincide exatamente com a soma de `valor_bruto` nas linhas de itens. Resultado: $410.000$ aprovados ($0$ divergências).
 Resultados auditados e persistidos na tabela `qa.execucao_assercao`.
 
 <br>
@@ -133,7 +133,7 @@ Resultados auditados e persistidos na tabela `qa.execucao_assercao`.
 
 **O que o dado mostrava:** 
 A inspeção da base consolidada em escala 1.0 (seed 20262) revelou duas anomalias que violam premissas de domínio físico e contábil:
-1. *Frete Negativo:* Presente em 1.174 pedidos (0,286% dos 410.000 pedidos), sendo 362 pedidos no ERP Legado (0,278% do canal; variação de -R$ 88,78 a -R$ 0,01; soma: -R$ 16.098,86; média: -R$ 44,47) e 812 pedidos no E-commerce (0,290% do canal; variação de -R$ 78,86 a -R$ 0,01; soma: -R$ 32.248,65; média: -R$ 39,72). No ERP Legado, a prova contábil demonstrou que em 100,0% dos 362 pedidos o total faturado subtraiu o frete negativo, evidenciando uso do campo como artifício para conceder subsídio logístico ou estorno comercial ao cliente. No total, as anomalias de frete perfazem -R$ 48.347,51.
+1. *Frete Negativo:* Presente em $1.174$ pedidos ($0,286%$ dos $410.000$ pedidos), sendo $362$ pedidos no ERP Legado ($0,278%$ do canal; variação de -R$ 88,78 a -R$ 0,01; soma: -R$ 16.098,86; média: -R$ 44,47) e 812 pedidos no E-commerce (0,290% do canal; variação de -R$ 78,86 a -R$ 0,01; soma: -R$ 32.248,65; média: -R$ 39,72). No ERP Legado, a prova contábil demonstrou que em 100,0% dos 362 pedidos o total faturado subtraiu o frete negativo, evidenciando uso do campo como artifício para conceder subsídio logístico ou estorno comercial ao cliente. No total, as anomalias de frete perfazem -R$ 48.347,51.
 2. *Desconto Sentinela `-1`:* Presente em 4.056 linhas de itens do ERP Legado (1,021% dos itens do canal), afetando 4.003 pedidos distintos (3,079% dos pedidos do legado). Não existe nenhum outro valor negativo além do literal exato `-1.00`. No E-commerce, essa anomalia é inexistente (0 itens). Trata-se de código sentinela legado para indicar produto inelegível para descontos promocionais. Se calculado aritmeticamente na receita líquida ($\text{Preço} \times \text{QTD} - \text{Desconto}$), geraria $-(-1) = +1$, inflacionando artificialmente a receita em R$ 4.056,00.
 
 **Alternativas consideradas:**
