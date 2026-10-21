@@ -429,6 +429,119 @@ O perfilamento empírico da base total de 410.000 pedidos e 160.000 avaliações
 Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 
 <br>
+<br>
+
+### Ficha RDT-10 — Itens Orfãos
+
+**Decisão:** 
+
+**Etapa do pipeline:** 
+
+**O que o dado mostrava:** 
+
+
+**Alternativas consideradas:**
+
+
+**Decisão:**
+
+**Justificativa:** 
+
+**O que se perde:** 
+
+**Registros afetados:** 
+
+**Asserção associada:** 
+
+<br>
+<br>
+
+### Ficha RDT-11 — Declaração de grão de `fato_pedido` e `fato_item_pedido`
+
+**Decisão:** adoção da arquitetura dimensional de grão duplo (*dual grain* de Ralph Kimball), segregando a transação do pedido (`dw.fato_pedido`) das linhas de produtos comercializados (`dw.fato_item_pedido`), com a formalização das declarações canônicas de grão:
+1. *"Uma linha de `dw.fato_pedido` representa a transação de um pedido de compra individual emitido por um cliente em uma data e canal específicos."*
+2. *"Uma linha de `dw.fato_item_pedido` representa a ocorrência de um produto comercializado (linha de item) dentro de um determinado pedido."*
+
+**Etapa do pipeline:** 03_carga_dw · `carrega_fato_pedido` e `carrega_fato_item`
+
+**O que o dado mostrava:** 
+As origens transacionais (ERP Legado no MySQL e E-commerce no PostgreSQL) operam com arquiteturas relacionais de cabeçalho e detalhe:
+- **Cabeçalhos de pedidos:** 130.000 pedidos no ERP Legado (`PEDIDOS`) e 280.000 pedidos no E-commerce (`orders`), totalizando 410.000 transações de compra consolidadas.
+- **Itens de pedidos:** 397.453 itens no Legado (`ITENS_PEDIDO`) e 995.000 itens no E-commerce (`order_item`), totalizando 1.392.453 linhas de itens (uma média de ~3,4 itens por pedido).
+Métricas financeiras como frete e status de entrega existem exclusivamente no grão do pedido, ao passo que métricas como quantidade, preço unitário e desconto por item existem no grão do produto.
+
+**Alternativas consideradas:**
+1. *Grão Único de Item (Fato Desnormalizada 1:N):* Armazenar apenas uma tabela-fato no grão de item, repetindo os atributos de cabeçalho (data do pedido, cliente, status, frete) em cada linha de item. Descartada: destrói a aditividade das métricas de cabeçalho. Ao calcular o frete total ou faturamento via `SUM()`, os valores seriam multiplicados pela quantidade de itens do pedido, gerando distorções financeiras graves nos relatórios gerenciais e na ABT.
+2. *Grão Único de Pedido (Fato Agregada 1:1):* Armazenar apenas uma tabela-fato no grão de pedido, descartando a granularidade atômica dos produtos ou agregando-os em listas/contagens simples. Descartada: inviabiliza análises de cesta de compras (*market-basket*), propensão de compra por categoria de produto e associação de produtos na mineração de dados.
+3. *Grão Duplo de Kimball (Duas Tabelas-Fato Complementares):* Implementar `dw.fato_pedido` (grão de pedido) e `dw.fato_item_pedido` (grão de item) ligadas por chave estrangeira (`pedido_sk`). Adotada.
+
+**Decisão:** Alternativa 3.
+
+**Justificativa:** 
+Garante conformidade matemática e aditividade perfeita em 100% das métricas do DW, respeitando os princípios de modelagem dimensional de Kimball. Na `dw.fato_pedido`, métricas de nível de transação (`valor_total`, `valor_frete`, `dias_entrega`) somam e tiram média de forma consistente sem risco de produto cartesiano. Na `dw.fato_item_pedido`, métricas atômicas de produto (`quantidade`, `valor_unitario`, `valor_linha`) permitem análises profundas de sortimento e afinidade de categorias sem contaminar os totais de caixa da empresa.
+
+**O que se perde:** 
+Perde-se a simplicidade de consultar uma tabela única desnormalizada. Para análises que cruzam atributos do cliente/pedido com o produto específico comprado, analistas precisam realizar um `JOIN` entre as duas tabelas-fato (`fato_pedido` e `fato_item_pedido`), aumentando a complexidade das consultas OLAP.
+
+**Registros afetados:** 
+- `dw.fato_pedido`: 410.000 pedidos consolidados (130.000 do legado e 280.000 do e-commerce).
+- `dw.fato_item_pedido`: 1.392.453 itens vinculados (397.453 do legado e 995.000 do e-commerce).
+
+**Asserção associada:** 
+- `qa.igual("total fato_pedido", ...)`: Validação de 410.000 pedidos carregados.
+- `qa.igual("total fato_item_pedido", ...)`: Validação de integridade dos itens.
+- `qa.igual("reconciliacao financeira legado", ...)`: Validação de que $\sum \text{valor\_total}$ bate com a origem em $\pm 0,1\%$.
+- `qa.igual("reconciliacao financeira ecommerce", ...)`: Validação de faturamento sem distorção por multiplicidade de itens.
+
+<br>
+<br>
+
+### Ficha RDT-12 — Pedidos sem cliente correspondente
+
+**Decisão:** 
+
+**Etapa do pipeline:** 
+
+**O que o dado mostrava:** 
+
+
+**Alternativas consideradas:**
+
+
+**Decisão:**
+
+**Justificativa:** 
+
+**O que se perde:** 
+
+**Registros afetados:** 
+
+**Asserção associada:** 
+
+<br>
+<br>
+
+### Ficha RDT-13 — Atendimentos e avaliações que não ligam a nenhum pedido
+
+**Decisão:** 
+
+**Etapa do pipeline:** 
+
+**O que o dado mostrava:** 
+
+
+**Alternativas consideradas:**
+
+
+**Decisão:**
+
+**Justificativa:** 
+
+**O que se perde:** 
+
+**Registros afetados:** 
+
+**Asserção associada:** 
 
 ---
 
@@ -448,7 +561,7 @@ Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 | RDT-08 | Classificação de ausências, anulação de 1900-01-01 e de inversões temporais com flags | 3.483 pedidos (1.025 sentinela 1900 + 2.458 invertidos)       | 0,85% da base                        | Sim (datas reais irrecuperáveis excluídas do cálculo de SLA; rastreabilidade retida em flags)                                                        |
 | RDT-09 | Padronização temporal em UTC e conversão de fontes ingênuas sob Horário de Brasília   | 130.000 pedidos (legado) + 31.915 avaliações (marketplace)    | 31,7% (pedidos) / 19,9% (avaliações) | Sim (hora visual de relógio de parede nas lojas físicas substituída pelo padrão astronômico UTC; 11 pedidos noturnos de 30/06 alocados em 01/07 UTC) |
 | RDT-10 | Itens órfãos                                                                          |                                                               |                                      |                                                                                                                                                      |
-| RDT-11 | Declaração de grão de fato_pedido e fato_item_pedido                                  |                                                               |                                      |                                                                                                                                                      |
+| RDT-11 | Declaração de grão de fato_pedido e fato_item_pedido                                  | 410.000 pedidos (fato_pedido) / 1.392.453 itens (fato_item)   | 100,0%                               | Não (preserva a aditividade atômica e agregada de Kimball; exige JOIN entre fatos para consultas combinadas)                                         |
 | RDT-12 | Pedidos sem cliente correspondente                                                    |                                                               |                                      |                                                                                                                                                      |
 | RDT-13 | Atendimentos desconectados                                                            |                                                               |                                      |                                                                                                                                                      |
 | RDT-14 | Engenharia de atributos da ABT sem vazamento                                          |                                                               |                                      |                                                                                                                                                      |
