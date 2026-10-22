@@ -231,7 +231,7 @@ def carrega_fato_pedido(qa):
     origens = pd.read_sql("""
         SELECT 
             'LEGADO' AS sistema,
-            ROUND(SUM(\"VALOR_TOTAL\")::numeric, 2) AS total_origem
+            ROUND(SUM("VALOR_TOTAL")::numeric, 2) AS total_origem
         FROM stg.legado_pedidos
         UNION ALL
         SELECT 
@@ -254,7 +254,56 @@ def carrega_fato_pedido(qa):
 
 def carrega_fato_item(qa):
     """TODO 3.3 (Lorena / RDT-10) — Tratamento e carga dos itens órfãos."""
-    pass
+    print("-> Carregando dw.fato_item_pedido (RDT-10)...", flush=True)
+    dw = eng_dw()
+
+    # 1. Carrega dados da staging e do DW
+    df_itens = pd.read_sql("SELECT * FROM stg.itens_valores_conformados", dw)
+    df_pedidos_dw = pd.read_sql("SELECT pedido_sk, id_origem, sistema_origem FROM dw.fato_pedido", dw)
+    df_produtos_dw = pd.read_sql("SELECT produto_sk, id_legado, id_ecommerce, origem FROM dw.dim_produto", dw)
+
+    # 2. Cruza itens com pedidos para identificar o pedido_sk
+    df_itens = df_itens.merge(
+        df_pedidos_dw[["pedido_sk", "id_origem", "sistema_origem"]],
+        left_on=["id_pedido_origem", "sistema_origem"],
+        right_on=["id_origem", "sistema_origem"],
+        how="left"
+    )
+
+    # 3. Descarta os itens órfãos (conforme RDT-10)
+    total_itens_original = len(df_itens)
+    df_validos = df_itens[df_itens["pedido_sk"].notna()].copy()
+    itens_orfaos = total_itens_original - len(df_validos)
+    taxa_orfaos = (itens_orfaos / total_itens_original) * 100
+    print(f"   Itens válidos: {len(df_validos)}")
+    print(f"   Itens órfãos descartados: {itens_orfaos} ({taxa_orfaos:.2f}%)")
+
+    # 4. Cruza produtos para identificar o produto_sk
+    mapa_prod_leg = df_produtos_dw.dropna(subset=["id_legado"]).set_index(df_produtos_dw["id_legado"].dropna().astype("int64"))["produto_sk"]
+    mapa_prod_ecom = df_produtos_dw.dropna(subset=["id_ecommerce"]).set_index(df_produtos_dw["id_ecommerce"].dropna().astype("int64"))["produto_sk"]
+
+    df_validos["produto_sk"] = None
+    df_validos.loc[df_validos["sistema_origem"] == "LEGADO", "produto_sk"] = df_validos["id_produto_origem"].map(mapa_prod_leg)
+    df_validos.loc[df_validos["sistema_origem"] == "ECOM", "produto_sk"] = df_validos["id_produto_origem"].map(mapa_prod_ecom)
+
+    # 5. Grava no DW
+    colunas_item = ["pedido_sk", "produto_sk", "quantidade", "valor_unitario", "valor_desconto", "valor_linha"]
+    df_fato_item = df_validos[colunas_item]
+
+    with dw.begin() as conn:
+        conn.execute(text("TRUNCATE dw.fato_item_pedido RESTART IDENTITY CASCADE;"))
+    df_fato_item.to_sql("fato_item_pedido", dw, schema="dw", if_exists="append", index=False, chunksize=10_000)
+    print(f"-> fato_item_pedido carregada com sucesso: {len(df_fato_item)} itens.", flush=True)
+
+    # 6. Asserções de qualidade da RDT-10
+    qa.igual("total itens carregados fato_item_pedido", len(df_fato_item), 1371876,
+             "1.371.876 itens vinculados a pedidos existentes carregados")
+    qa.igual("total itens orfaos descartados rdt10", itens_orfaos, 20577,
+             "Exatamente 20.577 itens órfãos descartados conforme RDT-10")
+    qa.sem_nulos("pedido_sk sem nulos em fato_item_pedido", df_fato_item["pedido_sk"],
+                 "Nenhum item pode ter pedido_sk nulo")
+    qa.sem_nulos("produto_sk sem nulos em fato_item_pedido", df_fato_item["produto_sk"],
+                 "Nenhum item pode ter produto_sk nulo")
 
 
 def carrega_fatos_auxiliares(qa):
