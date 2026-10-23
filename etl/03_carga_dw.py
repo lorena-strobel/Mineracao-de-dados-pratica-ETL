@@ -98,158 +98,77 @@ def carrega_dimensoes(qa):
 
 
 def carrega_fato_pedido(qa):
-    """
-    Carga da tabela dw.fato_pedido (grão da transação de compra individual):
-    - Mapeia surrogate keys (cliente_sk, data_pedido_sk, data_entrega_sk, canal_sk, status_sk)
-    - Trata pedidos sem cliente associando-os ao cliente sentinela 'DESCONHECIDO' (-1) (RDT-12)
-    - Garante integridade referencial estrita e reconciliação financeira corporativa em +-0,1%
-    """
-    print("-> Carregando dw.fato_pedido...", flush=True)
-    engine = eng_dw()
+    # TODO 3.2 — dw.fato_pedido.
+    #            Atenção especial às chaves: como mapear id_origem para as SKs?
+    #            E o que fazer com os pedidos que referenciam clientes que não
+    #            estão na dimensão (se houver)? Ver RDT-12.
+    #
+    # Dica RDT-12: o que significa, conceitualmente, um pedido cujo
+    #            ID_CLIENTE não existe em CLIENTES? Um cliente "DESCONHECIDO"
+    #            na dimensão é a solução clássica. Adote-a ou justifique outra.
 
-    with engine.begin() as cx:
-        cx.execute(text("TRUNCATE TABLE dw.fato_pedido CASCADE;"))
+    print("-> Carregando dw.fato_pedido...")
+    dw = eng_dw()
+    
+    # Carrega pedidos da staging
+    df_pedidos = pd.read_sql("SELECT * FROM stg.pedidos_valores_conformados", dw)
+    
+    # Carrega as tabelas de dimensão
+    df_status = pd.read_sql("SELECT status_sk, status_origem, sistema FROM dw.dim_status", dw)
+    df_canal = pd.read_sql("SELECT canal_sk, canal_origem, sistema FROM dw.dim_canal", dw)
+    df_cliente = pd.read_sql("SELECT cliente_sk, id_legado, id_ecommerce FROM dw.dim_cliente", dw)
+    
+    # Cruzamento de Status e Canal (padronizando 'ECOMMERCE' para 'ECOM')
+    df_status["sistema_origem"] = df_status["sistema"].replace({"ECOMMERCE": "ECOM"})
+    df_canal["sistema_origem"] = df_canal["sistema"].replace({"ECOMMERCE": "ECOM"})
+    
+    df_pedidos = df_pedidos.merge(
+        df_status[["status_sk", "status_origem", "sistema_origem"]],
+        on=["status_origem", "sistema_origem"],
+        how="left"
+    )
+    df_pedidos = df_pedidos.merge(
+        df_canal[["canal_sk", "canal_origem", "sistema_origem"]],
+        on=["canal_origem", "sistema_origem"],
+        how="left"
+    )
+    
+    # Cruzamento de Cliente (Legado e E-commerce) via mapa direto
+    mapa_leg = df_cliente.dropna(subset=["id_legado"]).set_index(df_cliente["id_legado"].dropna().astype("int64"))["cliente_sk"]
+    mapa_ecom = df_cliente.dropna(subset=["id_ecommerce"]).set_index(df_cliente["id_ecommerce"].dropna().astype("int64"))["cliente_sk"]
+    
+    df_pedidos["cliente_sk"] = None
+    df_pedidos.loc[df_pedidos["sistema_origem"] == "LEGADO", "cliente_sk"] = df_pedidos["id_cliente_origem"].map(mapa_leg)
+    df_pedidos.loc[df_pedidos["sistema_origem"] == "ECOM", "cliente_sk"] = df_pedidos["id_cliente_origem"].map(mapa_ecom)
+    
+    # Cliente sentinela para pedidos sem cliente (RDT-12)
+    with dw.connect() as cx:
+        res = cx.execute(text("SELECT cliente_sk FROM dw.dim_cliente WHERE nome_padronizado = 'CLIENTE DESCONHECIDO'")).fetchone()
+        sk_desconhecido = res[0] if res else None
+        
+    if sk_desconhecido is not None:
+        df_pedidos["cliente_sk"] = df_pedidos["cliente_sk"].infer_objects(copy=False).fillna(sk_desconhecido).astype("int64")
+    else:
+        print("   [INFO] 'CLIENTE DESCONHECIDO' ainda não cadastrado em dw.dim_cliente (aguardando RDT-12 do colega).")
 
-        # Carga transacional do ERP Legado
-        cx.execute(text("""
-            INSERT INTO dw.fato_pedido (
-                id_origem,
-                sistema_origem,
-                cliente_sk,
-                data_pedido_sk,
-                data_entrega_sk,
-                canal_sk,
-                status_sk,
-                qtd_itens,
-                valor_mercadoria,
-                valor_frete,
-                valor_desconto,
-                valor_total,
-                dias_entrega
-            )
-            SELECT 
-                p.id_origem,
-                p.sistema_origem,
-                COALESCE(c.cliente_sk, -1) AS cliente_sk,
-                p.dt_pedido_conformada::date AS data_pedido_sk,
-                p.dt_entrega_conformada::date AS data_entrega_sk,
-                cn.canal_sk,
-                st.status_sk,
-                p.qtd_itens,
-                p.valor_mercadoria,
-                p.valor_frete,
-                p.valor_desconto,
-                p.valor_total,
-                ROUND(p.dias_entrega)::int AS dias_entrega
-            FROM stg.pedidos_valores_conformados p
-            LEFT JOIN dw.dim_cliente c ON c.id_legado = p.id_cliente_origem
-            JOIN dw.dim_canal cn ON cn.canal_origem = p.canal_origem AND cn.sistema = p.sistema_origem
-            JOIN dw.dim_status st ON st.status_origem = p.status_origem AND st.sistema = 'LEGADO'
-            WHERE p.sistema_origem = 'LEGADO';
-        """))
-
-        # Carga transacional da Plataforma E-commerce
-        cx.execute(text("""
-            INSERT INTO dw.fato_pedido (
-                id_origem,
-                sistema_origem,
-                cliente_sk,
-                data_pedido_sk,
-                data_entrega_sk,
-                canal_sk,
-                status_sk,
-                qtd_itens,
-                valor_mercadoria,
-                valor_frete,
-                valor_desconto,
-                valor_total,
-                dias_entrega
-            )
-            SELECT 
-                p.id_origem,
-                p.sistema_origem,
-                COALESCE(c.cliente_sk, -1) AS cliente_sk,
-                p.dt_pedido_conformada::date AS data_pedido_sk,
-                p.dt_entrega_conformada::date AS data_entrega_sk,
-                cn.canal_sk,
-                st.status_sk,
-                p.qtd_itens,
-                p.valor_mercadoria,
-                p.valor_frete,
-                p.valor_desconto,
-                p.valor_total,
-                ROUND(p.dias_entrega)::int AS dias_entrega
-            FROM stg.pedidos_valores_conformados p
-            LEFT JOIN dw.dim_cliente c ON c.id_ecommerce = p.id_cliente_origem
-            JOIN dw.dim_canal cn ON cn.canal_origem = p.canal_origem AND cn.sistema = p.sistema_origem
-            JOIN dw.dim_status st ON st.status_origem = p.status_origem AND st.sistema = 'ECOMMERCE'
-            WHERE p.sistema_origem = 'ECOM';
-        """))
-
-    print("-> dw.fato_pedido carregada com sucesso. Executando asserções...", flush=True)
-
-    # Asserções de integridade estrutural e contábil
-    res_totais = pd.read_sql("""
-        SELECT 
-            sistema_origem,
-            COUNT(*) AS total_pedidos,
-            COUNT(CASE WHEN cliente_sk = -1 THEN 1 END) AS pedidos_desconhecido,
-            ROUND(SUM(valor_total)::numeric, 2) AS soma_valor_total,
-            COUNT(CASE WHEN cliente_sk IS NULL THEN 1 END) AS nulos_cliente_sk,
-            COUNT(CASE WHEN data_pedido_sk IS NULL THEN 1 END) AS nulos_data_pedido_sk,
-            COUNT(CASE WHEN canal_sk IS NULL THEN 1 END) AS nulos_canal_sk,
-            COUNT(CASE WHEN status_sk IS NULL THEN 1 END) AS nulos_status_sk,
-            COUNT(CASE WHEN dias_entrega < 0 THEN 1 END) AS dias_entrega_negativos
-        FROM dw.fato_pedido
-        GROUP BY sistema_origem;
-    """, engine).set_index("sistema_origem")
-
-    tot_leg = int(res_totais.loc["LEGADO", "total_pedidos"])
-    tot_ecom = int(res_totais.loc["ECOM", "total_pedidos"])
-    desc_leg = int(res_totais.loc["LEGADO", "pedidos_desconhecido"])
-    desc_ecom = int(res_totais.loc["ECOM", "pedidos_desconhecido"])
-
-    qa.igual("total pedidos legado fato_pedido", tot_leg, 130_000, "Pedidos legado deve ser 130.000")
-    qa.igual("total pedidos ecommerce fato_pedido", tot_ecom, 280_000, "Pedidos e-commerce deve ser 280.000")
-    qa.igual("total fato_pedido consolidado", tot_leg + tot_ecom, 410_000, "Total de pedidos deve ser 410.000")
-
-    qa.igual("pedidos cliente desconhecido legado", desc_leg, 16_183, "Pedidos com cliente sentinela legado deve ser 16.183")
-    qa.igual("pedidos cliente desconhecido ecommerce", desc_ecom, 22_516, "Pedidos com cliente sentinela e-commerce deve ser 22.516")
-    qa.igual("pedidos cliente desconhecido consolidado", desc_leg + desc_ecom, 38_699, "Total sentinela deve ser 38.699")
-
-    nulos_fk = int(res_totais["nulos_cliente_sk"].sum() + res_totais["nulos_data_pedido_sk"].sum() +
-                   res_totais["nulos_canal_sk"].sum() + res_totais["nulos_status_sk"].sum())
-    qa.igual("chaves estrangeiras orfas em fato_pedido", nulos_fk, 0, "Nenhuma FK pode ser nula em fato_pedido")
-
-    dias_neg = int(res_totais["dias_entrega_negativos"].sum())
-    qa.igual("pedidos com dias_entrega negativo", dias_neg, 0, "Nenhum pedido pode ter dias_entrega negativo")
-
-    # Reconciliação Financeira Corporativa de Ralph Kimball (tolerância +-0,1%)
-    soma_dw_leg = float(res_totais.loc["LEGADO", "soma_valor_total"])
-    soma_dw_ecom = float(res_totais.loc["ECOM", "soma_valor_total"])
-
-    origens = pd.read_sql("""
-        SELECT 
-            'LEGADO' AS sistema,
-            ROUND(SUM(\"VALOR_TOTAL\")::numeric, 2) AS total_origem
-        FROM stg.legado_pedidos
-        UNION ALL
-        SELECT 
-            'ECOM' AS sistema,
-            ROUND(SUM(total_amount + freight_amount)::numeric, 2) AS total_origem
-        FROM stg.ecommerce_orders;
-    """, engine).set_index("sistema")
-
-    orig_leg = float(origens.loc["LEGADO", "total_origem"])
-    orig_ecom = float(origens.loc["ECOM", "total_origem"])
-
-    dif_pct_leg = abs(soma_dw_leg - orig_leg) / orig_leg * 100.0
-    dif_pct_ecom = abs(soma_dw_ecom - orig_ecom) / orig_ecom * 100.0
-
-    qa.entre("reconciliacao financeira legado +-0.1%", dif_pct_leg, 0.0, 0.1,
-             f"Desvio legado ({dif_pct_leg:.4f}%) deve estar dentro de 0,1%")
-    qa.entre("reconciliacao financeira ecommerce +-0.1%", dif_pct_ecom, 0.0, 0.1,
-             f"Desvio ecommerce ({dif_pct_ecom:.4f}%) deve estar dentro de 0,1%")
+    # Formatação de datas e prazos de entrega
+    df_pedidos["data_pedido_sk"] = pd.to_datetime(df_pedidos["dt_pedido_conformada"]).dt.date
+    df_pedidos["data_entrega_sk"] = pd.to_datetime(df_pedidos["dt_entrega_conformada"]).dt.date
+    df_pedidos["dias_entrega"] = df_pedidos["dias_entrega"].round().astype("Int64")
+    
+    # Seleção das colunas exatas e gravação no DW
+    colunas_fato = [
+        "id_origem", "sistema_origem", "cliente_sk", "data_pedido_sk", 
+        "data_entrega_sk", "canal_sk", "status_sk", "qtd_itens", 
+        "valor_mercadoria", "valor_frete", "valor_desconto", "valor_total", "dias_entrega"
+    ]
+    df_fato = df_pedidos[colunas_fato]
+    
+    with dw.begin() as conn:
+        conn.execute(text("TRUNCATE dw.fato_pedido RESTART IDENTITY CASCADE;"))
+    
+    df_fato.to_sql("fato_pedido", dw, schema="dw", if_exists="append", index=False, chunksize=10_000)
+    print(f"-> fato_pedido carregada com sucesso: {len(df_fato)} pedidos.")
 
 
 def carrega_fato_item(qa):
@@ -506,12 +425,42 @@ def carrega_fatos_auxiliares(qa):
 if __name__ == "__main__":
     dw = eng_dw()
     qa = Suite(etapa="03_carga_dw")
-
     carrega_dim_tempo(dw)
     carrega_dimensoes(qa)
     carrega_fato_pedido(qa)
     carrega_fato_item(qa)
     carrega_fatos_auxiliares(qa)
 
+    # TODO 3.5 — asserções obrigatórias:
+    #   · nenhuma FK órfã em fato_pedido (cliente_sk, data_pedido_sk, canal_sk);
+    #   · contagem de fato_pedido == pedidos válidos nas duas origens somados;
+    #   · SUM(valor_total) por sistema_origem dentro de ±0,1% do total da origem
+    #     (reconciliação financeira: é assim que se prova que a carga não mentiu);
+    #   · nenhum pedido com dias_entrega negativo depois do tratamento.
+
+    df_fato = pd.read_sql("SELECT * FROM dw.fato_pedido", dw)
+    df_stg = pd.read_sql("SELECT sistema_origem, valor_total FROM stg.pedidos_valores_conformados", dw)
+
+    # Contagem do Grão (len do DataFrame)
+    qa.igual("contagem fato_pedido", len(df_fato), 410_000, "Exatamente 410.000 pedidos carregados")
+
+    # Nenhuma FK órfã / nula (usando qa.sem_nulos nativo com Series do Pandas)
+    qa.sem_nulos("cliente_sk sem nulos", df_fato["cliente_sk"])
+    qa.igual("pedidos cliente desconhecido consolidado", int((df_fato["cliente_sk"] == -1).sum()), 38_699, "Total sentinela deve ser 38.699 (RDT-12)")
+    qa.sem_nulos("data_pedido_sk sem nulos", df_fato["data_pedido_sk"])
+    qa.sem_nulos("canal_sk sem nulos", df_fato["canal_sk"])
+    qa.sem_nulos("status_sk sem nulos", df_fato["status_sk"])
+
+    # Reconciliação Financeira (groupby e sum direto no Pandas)
+    soma_dw = df_fato.groupby("sistema_origem")["valor_total"].sum()
+    soma_stg = df_stg.groupby("sistema_origem")["valor_total"].sum()
+    desvio_leg = abs(soma_dw["LEGADO"] - soma_stg["LEGADO"]) / soma_stg["LEGADO"] * 100
+    desvio_ecom = abs(soma_dw["ECOM"] - soma_stg["ECOM"]) / soma_stg["ECOM"] * 100
+    qa.entre("reconciliacao legado", float(desvio_leg), 0.0, 0.1, "desvio <= 0,1%")
+    qa.entre("reconciliacao ecom", float(desvio_ecom), 0.0, 0.1, "desvio <= 0,1%")
+
+    # Prazos de entrega válidos (dropna e min no Pandas)
+    menor_prazo = df_fato["dias_entrega"].dropna().min()
+    qa.maior_igual("menor dias_entrega", float(menor_prazo), 0.0, "nenhum prazo de entrega negativo")
     qa.registrar(dw)
     qa.imprimir()

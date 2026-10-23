@@ -431,34 +431,47 @@ Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 <br>
 <br>
 
-### Ficha RDT-10 — Itens Orfãos
+### Ficha RDT-10 — Itens Órfãos sem Pedido Correspondente
 
-**Decisão:** 
+**Decisão:** descarte de 20.577 itens órfãos (1,48% do volume total de 1.392.453 itens na staging) que não possuem cabeçalho de pedido correspondente em `dw.fato_pedido`, garantindo integridade referencial estrita (`FOREIGN KEY (pedido_sk) REFERENCES dw.fato_pedido (pedido_sk) NOT NULL`) e impedindo a contaminação da modelagem dimensional com pedidos sintéticos artificiais.
 
-**Etapa do pipeline:** 
+**Etapa do pipeline:** 03_carga_dw · `carrega_fato_item`
 
 **O que o dado mostrava:** 
-
+Na junção relacional entre os itens conformados (`stg.itens_valores_conformados`) e os pedidos homologados (`dw.fato_pedido`) via chave composta `(id_pedido_origem, sistema_origem)`, constatou-se que **20.577 linhas de itens (1,478% da base total de 1.392.453 itens)** referenciam identificadores de pedidos inexistentes no DW:
+1. *No ERP Legado:* 5.868 itens órfãos (1,478% dos 397.086 itens do canal físico) referenciam `ID_PEDIDO` inexistentes em `dw.fato_pedido`.
+2. *No E-commerce:* 14.709 itens órfãos (1,478% dos 995.367 itens do canal virtual) referenciam `order_id` inexistentes em `dw.fato_pedido`.
+A taxa é rigorosamente idêntica e simétrica entre os dois sistemas (exatos 1,48%), evidenciando uma falha operacional transacional das fontes originais (ex.: gravação de itens sem confirmação do cabeçalho ou pedidos excluídos operacionalmente na origem sem exclusão em cascata dos itens).
 
 **Alternativas consideradas:**
+1. *Geração de Pedidos Sintéticos Fictícios no DW:* Inserir registros de pedidos artificiais em `dw.fato_pedido` para acomodar os itens órfãos. Descartada: violaria a integridade contábil e a reconciliação financeira do DW, inflando artificialmente o volume total de pedidos da empresa e criando transações sem cliente, sem data de compra real e sem canal fático.
+2. *Carga com Chave Nula (`pedido_sk = NULL`):* Manter os itens órfãos na tabela-fato com chave estrangeira nula. Descartada: viola a restrição de integridade referencial `FOREIGN KEY (pedido_sk) REFERENCES dw.fato_pedido (pedido_sk) NOT NULL` no PostgreSQL, além de tornar esses itens inúteis para mineração temporal e análise de valor do cliente, pois não se sabe quem comprou, quando comprou ou por qual canal.
+3. *Descarte dos Itens Órfãos com Registro e Auditoria Estrita:* Filtrar e descartar os 20.577 itens que possuem `pedido_sk IS NULL`, carregando no DW estritamente os 1.371.876 itens vinculados a pedidos reais comprovados, quantificando o descarte na suíte de testes (QA). Adotada.
 
-
-**Decisão:**
+**Decisão:** Alternativa 3.
 
 **Justificativa:** 
+Preserva a consistência contábil, analítica e relacional do Grão Duplo. Na modelagem dimensional, uma linha de item só existe como detalhe de uma transação de compra real. Ao restringir `dw.fato_item_pedido` exclusivamente aos 1.371.876 itens com `pedido_sk` válido, garante-se que toda análise de cesta de compras (*market-basket*), afinidade de produtos e faturamento por categoria na mineração de dados esteja 100% ancorada em transações auditadas da `dw.fato_pedido`. A perda de 1,48% é estatisticamente irrelevante e não enviesa a distribuição de sortimento do catálogo.
 
 **O que se perde:** 
+Perdem-se os registros desses 20.577 itens e seu valor individual de venda no grão de item. Para análises de estoque físico ou inventário contábil estrito que necessitem inspecionar itens faturados sem pedido, o analista deve consultar diretamente a tabela de staging bruta (`stg.itens_valores_conformados`).
 
 **Registros afetados:** 
+- 20.577 itens órfãos descartados (1,48% do total de itens: 5.868 no Legado e 14.709 no E-commerce).
+- 1.371.876 itens vinculados e carregados em `dw.fato_item_pedido` (98,52% da base).
 
-**Asserção associada:** 
+**Asserção associada:** Etapa 03 (`03_carga_dw.py`), asserções homologadas com 100% de aprovação:
+- `total itens carregados fato_item_pedido`: validação de exatamente 1.371.876 itens carregados.
+- `total itens orfaos descartados rdt10`: validação da contagem exata de 20.577 itens descartados.
+- `pedido_sk sem nulos em fato_item_pedido`: validação de 0 nulos em `pedido_sk`.
+- `produto_sk sem nulos em fato_item_pedido`: validação de 0 nulos em `produto_sk`.
 
 <br>
 <br>
 
 ### Ficha RDT-11 — Declaração de grão de `fato_pedido` e `fato_item_pedido`
 
-**Decisão:** adoção da arquitetura dimensional de grão duplo (*dual grain* de Ralph Kimball), segregando a transação do pedido (`dw.fato_pedido`) das linhas de produtos comercializados (`dw.fato_item_pedido`), com a formalização das declarações canônicas de grão:
+**Decisão:** adoção da arquitetura dimensional de grão duplo segregando a transação do pedido (`dw.fato_pedido`) das linhas de produtos comercializados (`dw.fato_item_pedido`), com a formalização das declarações canônicas de grão:
 1. *"Uma linha de `dw.fato_pedido` representa a transação de um pedido de compra individual emitido por um cliente em uma data e canal específicos."*
 2. *"Uma linha de `dw.fato_item_pedido` representa a ocorrência de um produto comercializado (linha de item) dentro de um determinado pedido."*
 
@@ -467,7 +480,7 @@ Todas auditadas e registradas na tabela `qa.execucao_assercao`.
 **O que o dado mostrava:** 
 As origens transacionais (ERP Legado no MySQL e E-commerce no PostgreSQL) operam com arquiteturas relacionais de cabeçalho e detalhe:
 - **Cabeçalhos de pedidos:** 130.000 pedidos no ERP Legado (`PEDIDOS`) e 280.000 pedidos no E-commerce (`orders`), totalizando 410.000 transações de compra consolidadas.
-- **Itens de pedidos:** 397.453 itens no Legado (`ITENS_PEDIDO`) e 995.000 itens no E-commerce (`order_item`), totalizando 1.392.453 linhas de itens (uma média de ~3,4 itens por pedido).
+- **Itens de pedidos:** 397.086 itens no Legado (`ITENS_PEDIDO`) e 995.367 itens no E-commerce (`order_item`), totalizando 1.392.453 linhas de itens (uma média de ~3,4 itens por pedido).
 Métricas financeiras como frete e status de entrega existem exclusivamente no grão do pedido, ao passo que métricas como quantidade, preço unitário e desconto por item existem no grão do produto.
 
 **Alternativas consideradas:**
@@ -484,14 +497,15 @@ Garante conformidade matemática e aditividade perfeita em 100% das métricas do
 Perde-se a simplicidade de consultar uma tabela única desnormalizada. Para análises que cruzam atributos do cliente/pedido com o produto específico comprado, analistas precisam realizar um `JOIN` entre as duas tabelas-fato (`fato_pedido` e `fato_item_pedido`), aumentando a complexidade das consultas OLAP.
 
 **Registros afetados:** 
-- `dw.fato_pedido`: 410.000 pedidos consolidados (130.000 do legado e 280.000 do e-commerce).
-- `dw.fato_item_pedido`: 1.392.453 itens vinculados (397.453 do legado e 995.000 do e-commerce).
+- `dw.fato_pedido`: 410.000 pedidos consolidados (130.000 do legado e 280.000 do e-commerce), totalizando R$ 1.026.984.164,97 em faturamento corporativo homologado (R$ 281.101.055,99 no Legado e R$ 745.883.108,98 no E-commerce).
+- `dw.fato_item_pedido`: 1.371.876 itens vinculados e carregados (após o descarte dos 20.577 itens órfãos do RDT-10 a partir de 1.392.453 itens da staging).
 
-**Asserção associada:** 
-- `qa.igual("total fato_pedido", ...)`: Validação de 410.000 pedidos carregados.
-- `qa.igual("total fato_item_pedido", ...)`: Validação de integridade dos itens.
-- `qa.igual("reconciliacao financeira legado", ...)`: Validação de que $\sum \text{valor}_{\text{total}}$ bate com a origem em $\pm 0,1\%$.
-- `qa.igual("reconciliacao financeira ecommerce", ...)`: Validação de faturamento sem distorção por multiplicidade de itens.
+**Asserção associada:** Etapa 03 (`03_carga_dw.py`), asserções homologadas com 100% de aprovação:
+- `contagem fato_pedido`: validação de exatamente 410.000 pedidos carregados.
+- `cliente_sk sem nulos`, `data_pedido_sk sem nulos`, `canal_sk sem nulos`, `status_sk sem nulos`: validação de 0 nulos em todas as chaves estrangeiras.
+- `reconciliacao legado`: validação de desvio contábil de 0,00% (dentro da tolerância corporativa de $\pm 0,1\%$).
+- `reconciliacao ecom`: validação de desvio contábil de 0,00% (dentro da tolerância corporativa de $\pm 0,1\%$).
+- `menor dias_entrega`: validação de que nenhum prazo de entrega é negativo ($\ge 0,0$ dias).
 
 <br>
 <br>
@@ -593,10 +607,10 @@ Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% 
 | RDT-07 | Conformação da taxonomia de produtos em 2 níveis e desambiguação léxica               | 3.000 produtos (legado)                                       | 20,0% do catálogo                    | Sim (categoria administrativa do legado sobreposta pela descrição fática; texto bruto retido em categoria_origem)                                    |
 | RDT-08 | Classificação de ausências, anulação de 1900-01-01 e de inversões temporais com flags | 3.483 pedidos (1.025 sentinela 1900 + 2.458 invertidos)       | 0,85% da base                        | Sim (datas reais irrecuperáveis excluídas do cálculo de SLA; rastreabilidade retida em flags)                                                        |
 | RDT-09 | Padronização temporal em UTC e conversão de fontes ingênuas sob Horário de Brasília   | 130.000 pedidos (legado) + 31.915 avaliações (marketplace)    | 31,7% (pedidos) / 19,9% (avaliações) | Sim (hora visual de relógio de parede nas lojas físicas substituída pelo padrão astronômico UTC; 11 pedidos noturnos de 30/06 alocados em 01/07 UTC) |
-| RDT-10 | Itens órfãos                                                                          |                                                               |                                      |                                                                                                                                                      |
-| RDT-11 | Declaração de grão de fato_pedido e fato_item_pedido                                  | 410.000 pedidos (fato_pedido) / 1.392.453 itens (fato_item)   | 100,0%                               | Não (preserva a aditividade atômica e agregada de Kimball; exige JOIN entre fatos para consultas combinadas)                                         |
-| RDT-12 | Pedidos sem cliente correspondente (cliente sentinela DESCONHECIDO)                   | 38.699 pedidos (16.183 legado + 22.516 e-commerce)            | 9,44% dos pedidos                    | Sim (perfil demográfico individual perdido; preservados R$ 95.206.869,23 de faturamento corporativo no cliente DESCONHECIDO)                      |
-| RDT-13 | Resolução sintática de produtos e fatos auxiliares (SAC e Avaliações)                 | 40.016 avaliações (SKU legado) + 5.918 SAC (cliente inferido) | 25,0% (avaliações) / 6,2% (SAC)      | Sim (assume-se que LEG-{id} mapeia o ID legado e que o reclamante do SAC é o titular da compra; 1.140 duplicações de protocolo no SAC deduplicadas)   |
+| RDT-10 | Descarte de itens órfãos sem pedido correspondente                                    | 20.577 itens descartados (5.868 legado + 14.709 e-commerce)   | 1,48% dos itens                      | Sim (20.577 itens desvinculados de pedidos excluídos do DW; integridade referencial estrita preservada em 1.371.876 itens válidos)                   |
+| RDT-11 | Declaração de grão duplo (fato_pedido e fato_item_pedido)                             | 410.000 pedidos (fato_pedido) / 1.371.876 itens (fato_item)   | 100,0%                               | Não (preserva a aditividade atômica e agregada de Kimball; exige JOIN entre fatos para consultas combinadas)                                         |
+| RDT-12 | Pedidos sem cliente correspondente (cliente sentinela DESCONHECIDO)                   | 38.699 pedidos (16.183 legado + 22.516 e-commerce)            | 9,44% dos pedidos                    | Sim (perfil demográfico individual perdido; preservados R$ 95.206.869,23 de faturamento corporativo no cliente DESCONHECIDO)                         |
+| RDT-13 | Resolução sintática de produtos e fatos auxiliares (SAC e Avaliações)                 | 40.016 avaliações (SKU legado) + 5.918 SAC (cliente inferido) | 25,0% (avaliações) / 6,2% (SAC)      | Sim (assume-se que LEG-{id} mapeia o ID legado e que o reclamante do SAC é o titular da compra; 1.140 duplicações de protocolo no SAC deduplicadas)  |
 | RDT-14 | Engenharia de atributos da ABT sem vazamento                                          |                                                               |                                      |                                                                                                                                                      |
 | RDT-15 | Vazamentos introduzidos deliberadamente                                               |                                                               |                                      |                                                                                                                                                      |
 
