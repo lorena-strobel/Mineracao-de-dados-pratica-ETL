@@ -739,19 +739,72 @@ def trata_datas_e_ausencias(qa):
 
 
 # ===========================================================================
-# DECISÃO 6 — CHAVES DAS FONTES DE ARQUIVO
+# DECISÃO 6 — CHAVES DAS FONTES DE ARQUIVO (RDT-13)
 # ===========================================================================
 def liga_sac_e_avaliacoes(qa):
     """
-    SAC:        chave composta (origem_sistema, id_pedido_origem) + cpf_cliente
-    Avaliações: order.ref no formato 'LEG-<id>' ou 'ECOM-<id>'
-
-    Quantos atendimentos e avaliações conseguem ser ligados a um pedido do DW?
-    O que fazer com os que não conseguem — descartar, ou manter com pedido_sk
-    nulo? A resposta depende da pergunta analítica; a sua é a recompra.
+    Auditoria e resolução relacional das fontes de arquivos (SAC e Marketplace)
+    contra os pedidos conformados (Decisão 6 / RDT-13):
+    - SAC: chave composta (origem_sistema, id_pedido_origem) + cpf_cliente
+    - Avaliações: order_ref no formato 'LEG-<id>' ou 'ECOM-<id>' e desambiguação sintática de SKU
     """
-    # TODO 2.6
-    raise NotImplementedError
+    print("-> Auditando ligação de SAC e Avaliações aos pedidos conformados (Decisão 6 / RDT-13)...", flush=True)
+    dw = eng_dw()
+
+    # 1. Auditoria de conectividade do SAC
+    df_sac = pd.read_sql("""
+        SELECT 
+            COUNT(*) AS total_sac,
+            COUNT(DISTINCT s.protocolo) AS protocolos_unicos,
+            COUNT(p.id_origem) AS sac_com_pedido,
+            COUNT(*) - COUNT(p.id_origem) AS sac_sem_pedido,
+            COUNT(c.cliente_sk) AS sac_com_cliente_cpf
+        FROM stg.sac_atendimentos s
+        LEFT JOIN stg.pedidos_valores_conformados p ON (
+            p.sistema_origem = s.origem_sistema
+            AND p.id_origem = (CASE WHEN s.origem_sistema = 'ECOM' THEN 'ECOM-' || s.id_pedido_origem ELSE 'LEG-' || s.id_pedido_origem END)
+        )
+        LEFT JOIN dw.dim_cliente c ON c.cpf_normalizado = REGEXP_REPLACE(s.cpf_cliente, '\\D', '', 'g');
+    """, dw).iloc[0]
+
+    tot_sac = int(df_sac["total_sac"])
+    prot_unicos = int(df_sac["protocolos_unicos"])
+    sac_ligados = int(df_sac["sac_com_pedido"])
+    sac_orfaos = int(df_sac["sac_sem_pedido"])
+    sac_cpf_direto = int(df_sac["sac_com_cliente_cpf"])
+
+    qa.igual("total atendimentos sac staging", tot_sac, 96_140, "Total de atendimentos brutos no SAC deve ser 96.140")
+    qa.igual("protocolos unicos sac staging", prot_unicos, 95_000, "Extração bruta contém 1.140 protocolos duplicados (95.000 únicos)")
+    qa.igual("atendimentos sac ligados a pedidos", sac_ligados, 96_140, "100% dos atendimentos devem possuir pedido correspondente na staging")
+    qa.igual("atendimentos sac orfaos de pedido", sac_orfaos, 0, "Zero atendimentos órfãos de pedido")
+    qa.igual("atendimentos sac com cpf em dim_cliente", sac_cpf_direto, 90_155, "90.155 atendimentos brutos possuem CPF cadastrado em dim_cliente")
+
+    # 2. Auditoria de conectividade do Marketplace (Avaliações)
+    df_aval = pd.read_sql("""
+        SELECT 
+            COUNT(*) AS total_aval,
+            COUNT(DISTINCT a.review_id) AS reviews_unicos,
+            COUNT(p.id_origem) AS aval_com_pedido,
+            COUNT(*) - COUNT(p.id_origem) AS aval_sem_pedido,
+            COUNT(CASE WHEN LEFT(a.product_sku, 4) = 'LEG-' THEN 1 END) AS sku_legado,
+            COUNT(CASE WHEN LEFT(a.product_sku, 4) != 'LEG-' THEN 1 END) AS sku_ecom
+        FROM stg.marketplace_avaliacoes a
+        LEFT JOIN stg.pedidos_valores_conformados p ON p.id_origem = a.order_ref;
+    """, dw).iloc[0]
+
+    tot_aval = int(df_aval["total_aval"])
+    rev_unicos = int(df_aval["reviews_unicos"])
+    aval_ligadas = int(df_aval["aval_com_pedido"])
+    aval_orfas = int(df_aval["aval_sem_pedido"])
+    aval_leg_sku = int(df_aval["sku_legado"])
+    aval_ecom_sku = int(df_aval["sku_ecom"])
+
+    qa.igual("total avaliacoes staging", tot_aval, 160_000, "Total de avaliações do marketplace deve ser 160.000")
+    qa.igual("reviews unicos avaliacoes staging", rev_unicos, 160_000, "100% das avaliações devem possuir review_id único")
+    qa.igual("avaliacoes ligadas a pedidos", aval_ligadas, 160_000, "100% das avaliações devem possuir pedido correspondente na staging")
+    qa.igual("avaliacoes orfas de pedido", aval_orfas, 0, "Zero avaliações órfãs de pedido")
+    qa.igual("avaliacoes mascara legado identificadas", aval_leg_sku, 40_016, "Exatamente 40.016 avaliações sob padrão sintético LEG-{id_legado}")
+    qa.igual("avaliacoes sku ecommerce identificadas", aval_ecom_sku, 119_984, "Exatamente 119.984 avaliações sob SKU de ecommerce direto")
 
 
 if __name__ == "__main__":
@@ -761,7 +814,7 @@ if __name__ == "__main__":
     conforma_valores(qa)
     conforma_categorias(qa)
     trata_datas_e_ausencias(qa)
-    # liga_sac_e_avaliacoes(qa)
+    liga_sac_e_avaliacoes(qa)
 
     # TODO 2.7 — asserções obrigatórias desta etapa:
     #   · dim_cliente sem cpf_normalizado duplicado entre linhas com CPF válido;

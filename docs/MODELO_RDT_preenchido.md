@@ -1,6 +1,6 @@
 # Registro de Decisões de Transformação (RDT)
 
-**Equipe:** Mateus de Souza Arruda e Lorena Strobel Campos  **Data:** 14/10/2026  **Versão do pipeline:** 0.2.0
+**Equipe:** Mateus de Souza Arruda e Lorena Strobel Campos  **Data:** 23/10/2026  **Versão do pipeline:** 0.3.0
 
 **Link Github:** https://github.com/lorena-strobel/Mineracao-de-dados-pratica-ETL.git
 
@@ -552,7 +552,7 @@ Perde-se a rastreabilidade do perfil demográfico, localização geográfica (ci
 
 **Decisão:** Carga integral dos fatos auxiliares `dw.fato_atendimento` (95.000 eventos únicos deduplicados a partir de 96.140 registros na staging) e `dw.fato_avaliacao` (160.000 eventos), com inferência de `cliente_sk` pelo pedido para os 5.918 atendimentos com CPFs não cadastrados, e desambiguação sintática de 40.016 avaliações de produtos físicos mascaradas sob `product_sku = 'LEG-{id_legado}'` via amarração com a chave primária `id_legado` de `dw.dim_produto`, preservando 23.654 interações de clientes dependentes das transações do RDT-12.
 
-**Etapa do pipeline:** 03_carga_dw · `carrega_fatos_auxiliares`
+**Etapa do pipeline:** 02_transformacao · `liga_sac_e_avaliacoes` (auditoria relacional na staging) e 03_carga_dw · `carrega_fatos_auxiliares` (carga física e surrogate keys)
 
 **O que o dado mostrava:** 
 A auditoria relacional nos dados de SAC (`stg.sac_atendimentos`) e Marketplace (`stg.marketplace_avaliacoes`) revelou duas heterogeneidades críticas de conectividade e uma anomalia de duplicação:
@@ -579,16 +579,25 @@ Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% 
 - `dw.fato_atendimento`: 95.000 atendimentos carregados (100% com pedido conectado; 5.918 clientes inferidos via pedido; 1.140 duplicações sintáticas expurgadas; 9.195 eventos dependentes das transações do RDT-12).
 - `dw.fato_avaliacao`: 160.000 avaliações carregadas (100% com pedido conectado; 40.016 produtos físicos desambiguados via `id_legado` [25,01% da base]; 14.459 eventos dependentes do RDT-12).
 
-**Asserção associada:** Etapa 03 (`03_carga_dw.py`), asserções homologadas com 100% de aprovação:
-- `total fato_atendimento`: validação de exatamente 95.000 atendimentos únicos carregados.
-- `protocolos unicos fato_atendimento`: confirmação de 0 duplicados em `protocolo`.
-- `total fato_avaliacao`: validação de exatamente 160.000 avaliações carregadas.
-- `reviews unicos fato_avaliacao`: confirmação de 0 duplicados em `review_id`.
-- `nulos pedido_sk em fato_atendimento` e `nulos pedido_sk em fato_avaliacao`: confirmação de 0 nulos em `pedido_sk`.
-- `nulos produto_sk em fato_avaliacao`: confirmação de que todas as 160.000 avaliações possuem `produto_sk` resolvido (0 nulos).
-- `nulos cliente_sk em fato_atendimento`: confirmação de que todos os 95.000 atendimentos possuem `cliente_sk` resolvido (0 nulos).
-- `avaliacoes produtos legado conectadas`: confirmação de exatamente 40.016 avaliações ligadas ao catálogo físico.
-- `avaliacoes produtos ecommerce conectadas`: confirmação de exatamente 119.984 avaliações ligadas ao catálogo virtual.
+**Asserção associada:** 
+1. *Etapa 02 (`02_transformacao.py · liga_sac_e_avaliacoes`):*
+   - `total atendimentos sac staging`: validação de 96.140 registros brutos.
+   - `protocolos unicos sac staging`: validação de 95.000 protocolos únicos.
+   - `atendimentos sac ligados a pedidos`: confirmação de que 100% dos atendimentos possuem pedido correspondente na staging (0 órfãos).
+   - `total avaliacoes staging`: validação de 160.000 avaliações brutas com 100% de `review_id` único.
+   - `avaliacoes ligadas a pedidos`: confirmação de que 100% das avaliações possuem pedido correspondente na staging (0 órfãos).
+   - `avaliacoes mascara legado identificadas`: validação de exatamente 40.016 avaliações sob o padrão `LEG-{id}`.
+   - `avaliacoes sku ecommerce identificadas`: validação de exatamente 119.984 avaliações sob SKU de e-commerce.
+2. *Etapa 03 (`03_carga_dw.py · carrega_fatos_auxiliares`):*
+   - `total fato_atendimento`: validação de exatamente 95.000 atendimentos únicos carregados.
+   - `protocolos unicos fato_atendimento`: confirmação de 0 duplicados em `protocolo`.
+   - `total fato_avaliacao`: validação de exatamente 160.000 avaliações carregadas.
+   - `reviews unicos fato_avaliacao`: confirmação de 0 duplicados em `review_id`.
+   - `nulos pedido_sk em fato_atendimento` e `nulos pedido_sk em fato_avaliacao`: confirmação de 0 nulos em `pedido_sk`.
+   - `nulos produto_sk em fato_avaliacao`: confirmação de que todas as 160.000 avaliações possuem `produto_sk` resolvido (0 nulos).
+   - `nulos cliente_sk em fato_atendimento`: confirmação de que todos os 95.000 atendimentos possuem `cliente_sk` resolvido (0 nulos).
+   - `avaliacoes produtos legado conectadas`: confirmação de exatamente 40.016 avaliações ligadas ao catálogo físico.
+   - `avaliacoes produtos ecommerce conectadas`: confirmação de exatamente 119.984 avaliações ligadas ao catálogo virtual.
 
 ---
 
