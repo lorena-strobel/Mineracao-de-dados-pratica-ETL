@@ -231,7 +231,7 @@ def carrega_fato_pedido(qa):
     origens = pd.read_sql("""
         SELECT 
             'LEGADO' AS sistema,
-            ROUND(SUM("VALOR_TOTAL")::numeric, 2) AS total_origem
+            ROUND(SUM(\"VALOR_TOTAL\")::numeric, 2) AS total_origem
         FROM stg.legado_pedidos
         UNION ALL
         SELECT 
