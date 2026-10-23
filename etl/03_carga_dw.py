@@ -258,8 +258,200 @@ def carrega_fato_item(qa):
 
 
 def carrega_fatos_auxiliares(qa):
-    """TODO 3.4 (Mateus / RDT-13) — Carga de fato_atendimento e fato_avaliacao."""
-    pass
+    """Carga dos fatos auxiliares: dw.fato_atendimento e dw.fato_avaliacao (RDT-13)."""
+    engine = eng_dw()
+
+    with engine.begin() as cx:
+        print("-> Truncando dw.fato_atendimento e dw.fato_avaliacao...", flush=True)
+        cx.execute(text("TRUNCATE TABLE dw.fato_atendimento RESTART IDENTITY CASCADE;"))
+        cx.execute(text("TRUNCATE TABLE dw.fato_avaliacao RESTART IDENTITY CASCADE;"))
+
+        # Carga de dw.fato_atendimento
+        # Deduplicação sintática de 1.140 protocolos duplicados na extração bruta (95.000 únicos).
+        # Resolução de cliente_sk com fallback para fp.cliente_sk para os 5.918 atendimentos sem CPF cadastrado.
+        print("-> Carregando dw.fato_atendimento (SAC)...", flush=True)
+        cx.execute(text("""
+            WITH sac_dedup AS (
+                SELECT DISTINCT ON (protocolo)
+                    protocolo,
+                    origem_sistema,
+                    id_pedido_origem,
+                    cpf_cliente,
+                    TO_DATE(data_abertura, 'DD/MM/YYYY') AS data_abertura_sk,
+                    CASE 
+                        WHEN NULLIF(TRIM(data_fechamento), '') IS NOT NULL 
+                        THEN TO_DATE(data_fechamento, 'DD/MM/YYYY') 
+                        ELSE NULL 
+                    END AS data_fechamento_sk,
+                    UPPER(TRIM(canal)) AS canal,
+                    TRIM(motivo) AS motivo_conformado,
+                    NULLIF(TRIM(nota_satisfacao), '')::int AS nota_satisfacao,
+                    NULLIF(REPLACE(TRIM(tempo_resolucao_horas), ',', '.'), '')::numeric(10,2) AS horas_resolucao,
+                    CASE 
+                        WHEN origem_sistema = 'ECOM' THEN 'ECOM-' || id_pedido_origem 
+                        ELSE 'LEG-' || id_pedido_origem 
+                    END AS id_pedido_formatado
+                FROM stg.sac_atendimentos
+                ORDER BY protocolo
+            )
+            INSERT INTO dw.fato_atendimento (
+                protocolo,
+                cliente_sk,
+                pedido_sk,
+                data_abertura_sk,
+                data_fechamento_sk,
+                canal,
+                motivo_conformado,
+                nota_satisfacao,
+                horas_resolucao
+            )
+            SELECT 
+                s.protocolo,
+                COALESCE(c.cliente_sk, fp.cliente_sk) AS cliente_sk,
+                fp.pedido_sk,
+                s.data_abertura_sk,
+                s.data_fechamento_sk,
+                s.canal,
+                s.motivo_conformado,
+                s.nota_satisfacao,
+                s.horas_resolucao
+            FROM sac_dedup s
+            LEFT JOIN dw.fato_pedido fp ON fp.id_origem = s.id_pedido_formatado
+            LEFT JOIN dw.dim_cliente c ON c.cpf_normalizado = REGEXP_REPLACE(s.cpf_cliente, '\\D', '', 'g');
+        """))
+
+        # Carga de dw.fato_avaliacao
+        # Resolução sintática hibrida de SKUs de produtos:
+        # - E-commerce (119.984 avaliações): match direto por dp.sku = a.product_sku
+        # - Legado físico (40.016 avaliações): desambiguação sintática SUBSTRING(a.product_sku FROM 5)::int = dp.id_legado
+        print("-> Carregando dw.fato_avaliacao (Marketplace)...", flush=True)
+        cx.execute(text("""
+            INSERT INTO dw.fato_avaliacao (
+                review_id,
+                pedido_sk,
+                produto_sk,
+                data_sk,
+                nota,
+                compra_verificada,
+                votos_uteis
+            )
+            SELECT 
+                a.review_id,
+                fp.pedido_sk,
+                dp.produto_sk,
+                SUBSTRING(a.submitted_at FROM 1 FOR 10)::date AS data_sk,
+                ROUND(NULLIF(TRIM(a.rating), '')::numeric)::int AS nota,
+                CASE 
+                    WHEN a.verified_purchase = 1 THEN TRUE 
+                    WHEN a.verified_purchase = 0 THEN FALSE 
+                    ELSE NULL 
+                END AS compra_verificada,
+                ROUND(a.helpful_votes)::int AS votos_uteis
+            FROM stg.marketplace_avaliacoes a
+            JOIN dw.fato_pedido fp ON fp.id_origem = a.order_ref
+            JOIN dw.dim_produto dp ON dp.sku = a.product_sku
+            WHERE a.product_sku NOT LIKE 'LEG-%'
+            UNION ALL
+            SELECT 
+                a.review_id,
+                fp.pedido_sk,
+                dp.produto_sk,
+                SUBSTRING(a.submitted_at FROM 1 FOR 10)::date AS data_sk,
+                ROUND(NULLIF(TRIM(a.rating), '')::numeric)::int AS nota,
+                CASE 
+                    WHEN a.verified_purchase = 1 THEN TRUE 
+                    WHEN a.verified_purchase = 0 THEN FALSE 
+                    ELSE NULL 
+                END AS compra_verificada,
+                ROUND(a.helpful_votes)::int AS votos_uteis
+            FROM stg.marketplace_avaliacoes a
+            JOIN dw.fato_pedido fp ON fp.id_origem = a.order_ref
+            JOIN dw.dim_produto dp ON dp.id_legado = SUBSTRING(a.product_sku FROM 5)::int
+            WHERE a.product_sku LIKE 'LEG-%';
+        """))
+
+        # Criação de índices b-tree para acelerar junções de análise e ABT
+        cx.execute(text("""
+            CREATE INDEX IF NOT EXISTS ix_fato_atendimento_cli ON dw.fato_atendimento (cliente_sk);
+            CREATE INDEX IF NOT EXISTS ix_fato_atendimento_ped ON dw.fato_atendimento (pedido_sk);
+            CREATE INDEX IF NOT EXISTS ix_fato_atendimento_data ON dw.fato_atendimento (data_abertura_sk);
+            CREATE INDEX IF NOT EXISTS ix_fato_avaliacao_ped ON dw.fato_avaliacao (pedido_sk);
+            CREATE INDEX IF NOT EXISTS ix_fato_avaliacao_prod ON dw.fato_avaliacao (produto_sk);
+            CREATE INDEX IF NOT EXISTS ix_fato_avaliacao_data ON dw.fato_avaliacao (data_sk);
+        """))
+
+    print("-> Fatos auxiliares carregados com sucesso. Executando asserções...", flush=True)
+
+    # Asserções de integridade para dw.fato_atendimento
+    df_sac = pd.read_sql("""
+        SELECT 
+            COUNT(*) AS total_atendimentos,
+            COUNT(pedido_sk) AS com_pedido,
+            COUNT(cliente_sk) AS com_cliente,
+            COUNT(CASE WHEN cliente_sk = -1 THEN 1 END) AS cliente_sentinela,
+            COUNT(CASE WHEN cliente_sk IS NULL THEN 1 END) AS nulos_cliente_sk,
+            COUNT(CASE WHEN pedido_sk IS NULL THEN 1 END) AS nulos_pedido_sk,
+            COUNT(CASE WHEN data_abertura_sk IS NULL THEN 1 END) AS nulos_data_abertura_sk,
+            COUNT(DISTINCT protocolo) AS protocolos_distintos
+        FROM dw.fato_atendimento;
+    """, engine).iloc[0]
+
+    qa.igual("total fato_atendimento", int(df_sac["total_atendimentos"]), 95_000,
+             "Total de atendimentos unicos pos-deduplicacao deve ser 95.000")
+    qa.igual("protocolos unicos fato_atendimento", int(df_sac["protocolos_distintos"]), 95_000,
+             "Cada protocolo deve ser estritamente unico")
+    qa.igual("atendimentos com pedido_sk", int(df_sac["com_pedido"]), 95_000,
+             "100% dos atendimentos devem possuir pedido vinculado")
+    qa.igual("atendimentos com cliente_sk", int(df_sac["com_cliente"]), 95_000,
+             "100% dos atendimentos devem possuir cliente_sk (direto ou inferido via pedido)")
+    qa.igual("nulos pedido_sk em fato_atendimento", int(df_sac["nulos_pedido_sk"]), 0,
+             "Nenhum atendimento pode ter pedido_sk nulo")
+    qa.igual("nulos cliente_sk em fato_atendimento", int(df_sac["nulos_cliente_sk"]), 0,
+             "Nenhum atendimento pode ter cliente_sk nulo")
+    qa.igual("nulos data_abertura_sk em fato_atendimento", int(df_sac["nulos_data_abertura_sk"]), 0,
+             "Nenhum atendimento pode ter data_abertura_sk nula")
+
+    # Asserções de integridade para dw.fato_avaliacao
+    df_aval = pd.read_sql("""
+        SELECT 
+            COUNT(*) AS total_avaliacoes,
+            COUNT(pedido_sk) AS com_pedido,
+            COUNT(produto_sk) AS com_produto,
+            COUNT(CASE WHEN pedido_sk IS NULL THEN 1 END) AS nulos_pedido_sk,
+            COUNT(CASE WHEN produto_sk IS NULL THEN 1 END) AS nulos_produto_sk,
+            COUNT(CASE WHEN data_sk IS NULL THEN 1 END) AS nulos_data_sk,
+            COUNT(DISTINCT review_id) AS reviews_distintos
+        FROM dw.fato_avaliacao;
+    """, engine).iloc[0]
+
+    qa.igual("total fato_avaliacao", int(df_aval["total_avaliacoes"]), 160_000,
+             "Total de avaliacoes deve ser exatamente 160.000")
+    qa.igual("reviews unicos fato_avaliacao", int(df_aval["reviews_distintos"]), 160_000,
+             "Cada review_id deve ser estritamente unico")
+    qa.igual("avaliacoes com pedido_sk", int(df_aval["com_pedido"]), 160_000,
+             "100% das avaliacoes devem possuir pedido vinculado")
+    qa.igual("avaliacoes com produto_sk", int(df_aval["com_produto"]), 160_000,
+             "100% das avaliacoes devem possuir produto vinculado")
+    qa.igual("nulos pedido_sk em fato_avaliacao", int(df_aval["nulos_pedido_sk"]), 0,
+             "Nenhuma avaliacao pode ter pedido_sk nulo")
+    qa.igual("nulos produto_sk em fato_avaliacao", int(df_aval["nulos_produto_sk"]), 0,
+             "Nenhuma avaliacao pode ter produto_sk nulo")
+    qa.igual("nulos data_sk em fato_avaliacao", int(df_aval["nulos_data_sk"]), 0,
+             "Nenhuma avaliacao pode ter data_sk nula")
+
+    # Validação de desambiguação sintática de produtos legados vs ecommerce
+    df_sub = pd.read_sql("""
+        SELECT 
+            COUNT(CASE WHEN p.origem = 'LEGADO' THEN 1 END) AS aval_legado,
+            COUNT(CASE WHEN p.origem = 'ECOM' THEN 1 END) AS aval_ecom
+        FROM dw.fato_avaliacao fa
+        JOIN dw.dim_produto p ON p.produto_sk = fa.produto_sk;
+    """, engine).iloc[0]
+
+    qa.igual("avaliacoes produtos legado conectadas", int(df_sub["aval_legado"]), 40_016,
+             "40.016 avaliacoes sob mascara LEG-{id_legado} devem estar conectadas a produtos legados")
+    qa.igual("avaliacoes produtos ecommerce conectadas", int(df_sub["aval_ecom"]), 119_984,
+             "119.984 avaliacoes sob SKU de ecommerce devem estar conectadas a produtos ecommerce")
 
 
 if __name__ == "__main__":

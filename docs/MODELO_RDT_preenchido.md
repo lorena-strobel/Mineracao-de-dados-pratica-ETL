@@ -536,42 +536,45 @@ Perde-se a rastreabilidade do perfil demográfico, localização geográfica (ci
 
 ### Ficha RDT-13 — Atendimentos e avaliações que não ligam a nenhum pedido e heterogeneidade estrutural de produtos
 
-**Decisão:** Carga integral dos fatos auxiliares `dw.fato_atendimento` (96.140 eventos) e `dw.fato_avaliacao` (160.000 eventos), com inferência de `cliente_sk` pelo pedido para os 5.985 atendimentos com CPFs não cadastrados, e desambiguação sintática de 40.016 avaliações de produtos físicos mascaradas sob `product_sku = 'LEG-{id_legado}'` via amarração com a chave primária `id_legado` de `dw.dim_produto`, preservando 23.654 interações de clientes dependentes das transações do RDT-12.
+**Decisão:** Carga integral dos fatos auxiliares `dw.fato_atendimento` (95.000 eventos únicos deduplicados a partir de 96.140 registros na staging) e `dw.fato_avaliacao` (160.000 eventos), com inferência de `cliente_sk` pelo pedido para os 5.918 atendimentos com CPFs não cadastrados, e desambiguação sintática de 40.016 avaliações de produtos físicos mascaradas sob `product_sku = 'LEG-{id_legado}'` via amarração com a chave primária `id_legado` de `dw.dim_produto`, preservando 23.654 interações de clientes dependentes das transações do RDT-12.
 
 **Etapa do pipeline:** 03_carga_dw · `carrega_fatos_auxiliares`
 
 **O que o dado mostrava:** 
-A auditoria relacional nos dados de SAC (`stg.sac_atendimentos`) e Marketplace (`stg.marketplace_avaliacoes`) revelou duas heterogeneidades críticas de conectividade:
-1. *Conectividade de Pedidos e Dependência do RDT-12:* Todos os 96.140 atendimentos do SAC e todas as 160.000 avaliações de marketplace possuem códigos de pedido válidos na origem (`id_pedido_origem` e `order_ref`). Contudo, o perfilamento comprovou que **23.654 eventos de clientes** (9.195 atendimentos do SAC [9,56%] e 14.459 avaliações [9,04%]) referenciam exatamente os 38.699 pedidos sem cliente resolvidos no RDT-12. Se esses pedidos tivessem sido descartados no RDT-12, 23.654 interações de clientes se tornariam subitamente órfãs no DW com `pedido_sk = NULL`.
-2. *Inferência Cadastral no SAC:* Dos 96.140 atendimentos do SAC, 90.155 (93,78%) conectam diretamente ao cliente via CPF em `dw.dim_cliente`, mas 5.985 atendimentos (6,22%) apresentam CPFs ausentes do cadastro consolidado. Como o pedido correspondente existe no DW, a chave do cliente (`cliente_sk`) pode ser herdada do próprio pedido.
+A auditoria relacional nos dados de SAC (`stg.sac_atendimentos`) e Marketplace (`stg.marketplace_avaliacoes`) revelou duas heterogeneidades críticas de conectividade e uma anomalia de duplicação:
+1. *Conectividade de Pedidos e Dependência do RDT-12:* Todos os atendimentos do SAC e todas as 160.000 avaliações de marketplace possuem códigos de pedido válidos na origem (`id_pedido_origem` e `order_ref`). Contudo, o perfilamento comprovou que **23.654 eventos de clientes** (9.195 atendimentos do SAC [9,56%] e 14.459 avaliações [9,04%]) referenciam exatamente os 38.699 pedidos sem cliente resolvidos no RDT-12. Se esses pedidos tivessem sido descartados no RDT-12, 23.654 interações de clientes se tornariam subitamente órfãs no DW com `pedido_sk = NULL`.
+2. *Deduplicação e Inferência Cadastral no SAC:* A extração bruta de `stg.sac_atendimentos` continha 96.140 registros com 1.140 duplicatas idênticas de protocolo. A aplicação da restrição de unicidade canônica (`protocolo UNIQUE`) consolidou **95.000 atendimentos únicos**. Destes, 89.082 (93,77%) conectam diretamente ao cliente via CPF em `dw.dim_cliente`, mas 5.918 atendimentos (6,23%) apresentam CPFs ausentes do cadastro consolidado. Como o pedido correspondente existe no DW, a chave do cliente (`cliente_sk`) é herdada do próprio pedido.
 3. *Heterogeneidade Sintática de Produtos nas Avaliações:* Das 160.000 avaliações do marketplace, 119.984 (74,99%) ligam diretamente ao produto através de `dw.dim_produto.sku` (catálogo virtual). Em contrapartida, **40.016 avaliações (25,01%)** referenciam produtos físicos do ERP Legado sob o código sintético `product_sku = 'LEG-{id_legado}'` (ex.: `LEG-1`, `LEG-10`, `LEG-1000`). Como a coluna `sku` para produtos físicos do legado é vazia em `dw.dim_produto`, uma junção ingênua (`dw.dim_produto.sku = a.product_sku`) deixaria 40.016 avaliações com `produto_sk = NULL`, desconectando 1/4 de todo o feedback de clientes sobre o catálogo físico.
 
 **Alternativas consideradas:**
-1. *Descarte de Eventos com Produtos Mascarados ou Sem Cadastro:* Descartar as 40.016 avaliações de produtos do legado e os 5.985 atendimentos de SAC sem CPF cadastrado. Descartada: causaria perda severa de 25% das avaliações e mais de 6% do SAC, enviesando negativamente a modelagem preditiva de churn e recompra na ABT da Semana 4.
+1. *Descarte de Eventos com Produtos Mascarados ou Sem Cadastro:* Descartar as 40.016 avaliações de produtos do legado e os atendimentos de SAC sem CPF cadastrado. Descartada: causaria perda severa de 25% das avaliações e mais de 6% do SAC, enviesando negativamente a modelagem preditiva de churn e recompra na ABT da Semana 4.
 2. *Carga com Chaves Nulas (`pedido_sk = NULL` e `produto_sk = NULL`):* Ingerir as linhas mantendo chaves estrangeiras nulas sem tentar resolver a desambiguação sintática. Descartada: negligencia a heterogeneidade semântica/sintática gerada pela plataforma de marketplace, deixando de associar as avaliações às categorias de produtos que de fato foram avaliadas.
-3. *Resolução Híbrida de Chaves com Desambiguação Sintática:*
-   - Para o SAC: Manter `pedido_sk` 100% preenchido; resolver `cliente_sk` preferencialmente via CPF e, nos 5.985 casos ausentes, inferir `cliente_sk` diretamente da transação em `dw.fato_pedido`.
+3. *Resolução Híbrida de Chaves com Desambiguação Sintática e Deduplicação:*
+   - Para o SAC: Deduplicação exata de protocolos em 95.000 eventos únicos; manter `pedido_sk` 100% preenchido; resolver `cliente_sk` preferencialmente via CPF e, nos 5.918 casos ausentes, inferir `cliente_sk` diretamente da transação em `dw.fato_pedido`.
    - Para Avaliações: Manter `pedido_sk` 100% preenchido via `order_ref`; resolver `produto_sk` via junção direta no `sku` para o e-commerce e via extração numérica `SUBSTRING(product_sku FROM 5)::int = id_legado` para o catálogo físico. Adotada.
 
 **Decisão:** Alternativa 3.
 
 **Justificativa:** 
-Garante integridade relacional e densidade informacional máxima em 100% dos fatos auxiliares. Ao recuperar o vínculo dos 40.016 produtos avaliados via `id_legado` e inferir o cliente dos 5.985 protocolos de atendimento pelo pedido, o Data Warehouse maximiza a precisão da engenharia de atributos preditivos para a Semana 4 (como nota média de satisfação por cliente e quantidade de chamados abertos), sem criar duplicidades nem descartar evidências empíricas reais.
+Garante integridade relacional e densidade informacional máxima em 100% dos fatos auxiliares. Ao recuperar o vínculo dos 40.016 produtos avaliados via `id_legado` e inferir o cliente dos 5.918 protocolos de atendimento pelo pedido, o Data Warehouse maximiza a precisão da engenharia de atributos preditivos para a Semana 4 (como nota média de satisfação por cliente e quantidade de chamados abertos), sem criar duplicidades nem descartar evidências empíricas reais.
 
 **O que se perde:** 
-Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% de exatidão a chave primária `ID_PRODUTO` do ERP Legado sem verificação cruzada de descrição textual. Nos 5.985 atendimentos com cliente inferido pelo pedido, assume-se que o solicitante do SAC é o próprio titular do pedido original de compra, descartando a possibilidade de reclamação aberta por terceiros.
+Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% de exatidão a chave primária `ID_PRODUTO` do ERP Legado sem verificação cruzada de descrição textual. Nos 5.918 atendimentos com cliente inferido pelo pedido, assume-se que o solicitante do SAC é o próprio titular do pedido original de compra, descartando a possibilidade de reclamação aberta por terceiros. As 1.140 linhas duplicadas de protocolos idênticos foram expurgadas.
 
 **Registros afetados:** 
-- `dw.fato_atendimento`: 96.140 atendimentos carregados (100% com pedido conectado; 5.985 clientes inferidos via pedido; 9.195 eventos dependentes das transações do RDT-12).
+- `dw.fato_atendimento`: 95.000 atendimentos carregados (100% com pedido conectado; 5.918 clientes inferidos via pedido; 1.140 duplicações sintáticas expurgadas; 9.195 eventos dependentes das transações do RDT-12).
 - `dw.fato_avaliacao`: 160.000 avaliações carregadas (100% com pedido conectado; 40.016 produtos físicos desambiguados via `id_legado` [25,01% da base]; 14.459 eventos dependentes do RDT-12).
 
-**Asserção associada:** Etapa 03 (`03_carga_dw.py`), asserções:
-- `total fato_atendimento`: validação de 96.140 atendimentos carregados.
-- `total fato_avaliacao`: validação de 160.000 avaliações carregadas.
-- `sem_nulos pedido_sk em fato_atendimento`: confirmação de 0 nulos em `pedido_sk`.
-- `sem_nulos pedido_sk em fato_avaliacao`: confirmação de 0 nulos em `pedido_sk`.
-- `sem_nulos produto_sk em fato_avaliacao`: confirmação de que todas as 160.000 avaliações possuem `produto_sk` resolvido (0 nulos).
-- `sem_nulos cliente_sk em fato_atendimento`: validação de integridade cadastral de clientes no SAC.
+**Asserção associada:** Etapa 03 (`03_carga_dw.py`), asserções homologadas com 100% de aprovação:
+- `total fato_atendimento`: validação de exatamente 95.000 atendimentos únicos carregados.
+- `protocolos unicos fato_atendimento`: confirmação de 0 duplicados em `protocolo`.
+- `total fato_avaliacao`: validação de exatamente 160.000 avaliações carregadas.
+- `reviews unicos fato_avaliacao`: confirmação de 0 duplicados em `review_id`.
+- `nulos pedido_sk em fato_atendimento` e `nulos pedido_sk em fato_avaliacao`: confirmação de 0 nulos em `pedido_sk`.
+- `nulos produto_sk em fato_avaliacao`: confirmação de que todas as 160.000 avaliações possuem `produto_sk` resolvido (0 nulos).
+- `nulos cliente_sk em fato_atendimento`: confirmação de que todos os 95.000 atendimentos possuem `cliente_sk` resolvido (0 nulos).
+- `avaliacoes produtos legado conectadas`: confirmação de exatamente 40.016 avaliações ligadas ao catálogo físico.
+- `avaliacoes produtos ecommerce conectadas`: confirmação de exatamente 119.984 avaliações ligadas ao catálogo virtual.
 
 ---
 
@@ -593,7 +596,7 @@ Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% 
 | RDT-10 | Itens órfãos                                                                          |                                                               |                                      |                                                                                                                                                      |
 | RDT-11 | Declaração de grão de fato_pedido e fato_item_pedido                                  | 410.000 pedidos (fato_pedido) / 1.392.453 itens (fato_item)   | 100,0%                               | Não (preserva a aditividade atômica e agregada de Kimball; exige JOIN entre fatos para consultas combinadas)                                         |
 | RDT-12 | Pedidos sem cliente correspondente (cliente sentinela DESCONHECIDO)                   | 38.699 pedidos (16.183 legado + 22.516 e-commerce)            | 9,44% dos pedidos                    | Sim (perfil demográfico individual perdido; preservados R$ 95.206.869,23 de faturamento corporativo no cliente DESCONHECIDO)                      |
-| RDT-13 | Resolução sintática de produtos e fatos auxiliares (SAC e Avaliações)                 | 40.016 avaliações (SKU legado) + 5.985 SAC (cliente inferido) | 25,0% (avaliações) / 6,2% (SAC)      | Sim (assume-se que LEG-{id} mapeia o ID legado e que o reclamante do SAC é o titular da compra)                                                     |
+| RDT-13 | Resolução sintática de produtos e fatos auxiliares (SAC e Avaliações)                 | 40.016 avaliações (SKU legado) + 5.918 SAC (cliente inferido) | 25,0% (avaliações) / 6,2% (SAC)      | Sim (assume-se que LEG-{id} mapeia o ID legado e que o reclamante do SAC é o titular da compra; 1.140 duplicações de protocolo no SAC deduplicadas)   |
 | RDT-14 | Engenharia de atributos da ABT sem vazamento                                          |                                                               |                                      |                                                                                                                                                      |
 | RDT-15 | Vazamentos introduzidos deliberadamente                                               |                                                               |                                      |                                                                                                                                                      |
 
