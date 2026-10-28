@@ -1,0 +1,40 @@
+<?xml version='1.0' encoding='utf-8'?>
+<scheme version="2.0" title="Experimento de Recompra 90d — ABT Correta (Sem Vazamento)" description="Fluxo experimental canônico (RDT-14): File -&gt; Data Sampler (70/30 estratificado, semente fixa) -&gt; Naive Bayes, Logistic Regression, Tree -&gt; Test &amp; Score (Test on Test Data) -&gt; Confusion Matrix e ROC Analysis.">
+	<nodes>
+		<node id="0" name="File" qualified_name="Orange.widgets.data.owfile.OWFile" project_name="Orange3" version="" title="File (ABT Correta)" position="(80.0, 260.0)" />
+		<node id="1" name="Data Sampler" qualified_name="Orange.widgets.data.owdatasampler.OWDataSampler" project_name="Orange3" version="" title="Data Sampler (70/30 Estratificado)" position="(260.0, 260.0)" />
+		<node id="2" name="Naive Bayes" qualified_name="Orange.widgets.model.ownaivebayes.OWNaiveBayes" project_name="Orange3" version="" title="Naive Bayes" position="(260.0, 60.0)" />
+		<node id="3" name="Logistic Regression" qualified_name="Orange.widgets.model.owlogisticregression.OWLogisticRegression" project_name="Orange3" version="" title="Logistic Regression" position="(260.0, 420.0)" />
+		<node id="4" name="Tree" qualified_name="Orange.widgets.model.owtree.OWTreeLearner" project_name="Orange3" version="" title="Tree" position="(260.0, 560.0)" />
+		<node id="5" name="Test and Score" qualified_name="Orange.widgets.evaluate.owtestandscore.OWTestAndScore" project_name="Orange3" version="" title="Test and Score" position="(520.0, 260.0)" />
+		<node id="6" name="Confusion Matrix" qualified_name="Orange.widgets.evaluate.owconfusionmatrix.OWConfusionMatrix" project_name="Orange3" version="" title="Confusion Matrix" position="(760.0, 160.0)" />
+		<node id="7" name="ROC Analysis" qualified_name="Orange.widgets.evaluate.owrocanalysis.OWROCAnalysis" project_name="Orange3" version="" title="ROC Analysis" position="(760.0, 360.0)" />
+	</nodes>
+	<links>
+		<link id="0" source_node_id="0" sink_node_id="1" source_channel="Data" sink_channel="Data" enabled="true" source_channel_id="data" sink_channel_id="data" />
+		<link id="1" source_node_id="1" sink_node_id="5" source_channel="Data Sample" sink_channel="Data" enabled="true" source_channel_id="data_sample" sink_channel_id="train_data" />
+		<link id="2" source_node_id="1" sink_node_id="5" source_channel="Remaining Data" sink_channel="Test Data" enabled="true" source_channel_id="remaining_data" sink_channel_id="test_data" />
+		<link id="3" source_node_id="2" sink_node_id="5" source_channel="Learner" sink_channel="Learner" enabled="true" source_channel_id="learner" sink_channel_id="learner" />
+		<link id="4" source_node_id="3" sink_node_id="5" source_channel="Learner" sink_channel="Learner" enabled="true" source_channel_id="learner" sink_channel_id="learner" />
+		<link id="5" source_node_id="4" sink_node_id="5" source_channel="Learner" sink_channel="Learner" enabled="true" source_channel_id="learner" sink_channel_id="learner" />
+		<link id="6" source_node_id="5" sink_node_id="6" source_channel="Evaluation Results" sink_channel="Evaluation Results" enabled="true" source_channel_id="evaluations_results" sink_channel_id="evaluation_results" />
+		<link id="7" source_node_id="5" sink_node_id="7" source_channel="Evaluation Results" sink_channel="Evaluation Results" enabled="true" source_channel_id="evaluations_results" sink_channel_id="evaluation_results" />
+	</links>
+	<annotations />
+	<thumbnail />
+	<node_properties>
+		<properties node_id="0" format="pickle">gASVVgEAAAAAAAB9lCiMBnNvdXJjZZRLAIwMcmVjZW50X3BhdGhzlF2UjB5vcmFuZ2V3aWRnZXQu
+dXRpbHMuZmlsZWRpYWxvZ3OUjApSZWNlbnRQYXRolJOUKYGUfZQojAdhYnNwYXRolIx6L2hvbWUv
+c3BhY2VyeS9Eb2N1bWVudHMvW0NvZGVSb290XS9JRk1UL01pbmVyYcOnw6NvIGRlIERhZG9zL01p
+bmVyYWNhby1kZS1kYWRvcy1wcmF0aWNhLUVUTC9zYWlkYS9hYnRfcmVjb21wcmFfY29ycmV0YS5j
+c3aUjAZwcmVmaXiUTowHcmVscGF0aJSMIS4uL3NhaWRhL2FidF9yZWNvbXByYV9jb3JyZXRhLmNz
+dpSMBXRpdGxllIwYYWJ0X3JlY29tcHJhX2NvcnJldGEuY3N2lIwFc2hlZXSUjACUjAtmaWxlX2Zv
+cm1hdJROdWJhdS4=
+</properties>
+		<properties node_id="1" format="literal">{'sampling_type': 0, 'sampleSizePercentage': 70, 'use_seed': True, 'stratify': True, 'replacement': False}</properties>
+		<properties node_id="5" format="literal">{'resampling': 5}</properties>
+	</node_properties>
+	<session_state>
+		<window_groups />
+	</session_state>
+</scheme>
