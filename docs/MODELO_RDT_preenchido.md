@@ -1,6 +1,6 @@
 # Registro de Decisões de Transformação (RDT)
 
-**Equipe:** Mateus de Souza Arruda e Lorena Strobel Campos  **Data:** 23/10/2026  **Versão do pipeline:** 0.3.0
+**Equipe:** Mateus de Souza Arruda e Lorena Strobel Campos  **Data:** 28/10/2026  **Versão do pipeline:** 0.4.0
 
 **Link Github:** https://github.com/lorena-strobel/Mineracao-de-dados-pratica-ETL.git
 
@@ -599,6 +599,58 @@ Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% 
    - `avaliacoes produtos legado conectadas`: confirmação de exatamente 40.016 avaliações ligadas ao catálogo físico.
    - `avaliacoes produtos ecommerce conectadas`: confirmação de exatamente 119.984 avaliações ligadas ao catálogo virtual.
 
+<br>
+<br>
+
+### Ficha RDT-14 — Engenharia de atributos da ABT sem vazamento
+
+**Decisão:** Construção programática via Pandas em lotes (`chunksize=50_000`) da tabela-base de análise `abt.recompra_90d` no grão atômico de cliente identificado (`cliente_sk <> -1`), consolidando 99.749 clientes reais e 12 atributos preditivos comportamentais calculados sob dupla barreira temporal estrita (`data <= DATE '2025-06-30'`), com imputação determinística por `0` para variáveis de contagem/volume e preservação de `NaN` (`NULL`) para médias condicionais sem observação válida no período (`prazo_medio_entrega` e `nota_media_avaliacoes`).
+
+**Etapa do pipeline:** 04_abt · `SQL_ALVO` e `monta_atributos_corretos`
+
+**O que o dado mostrava:** 
+O perfilamento sobre o esquema estrela (`dw`) na fronteira da data de corte (`2025-06-30`) evidenciou cinco condições críticas para a integridade preditiva:
+1. *Contaminação pelo Cliente Sentinela (`RDT-12`):* A consulta base de pedidos até `2025-06-30` retornava 99.750 chaves distintas, incluindo o registro sentinela `cliente_sk = -1` (`CLIENTE DESCONHECIDO`), que agrupa 38.699 pedidos anônimos antes e depois do corte e produziria uma instância artificial com `alvo_recompra_90d = 1`. Excluindo `cliente_sk = -1`, restam **99.749 clientes reais únicos**, dos quais **21.711 realizaram recompra** entre `2025-07-01` e `2025-09-28` (**taxa de positivos de 21,77%**), com 309.361 pedidos emitidos até o corte.
+2. *Vazamento Cadastral em `dw.dim_cliente`:* Dos 99.749 clientes com compras até `2025-06-30`, **14.878 clientes (14,92%)** apresentavam `dt_primeiro_cadastro > '2025-06-30'` (decorrente de unificação ou recadastro posterior no segundo canal). Utilizar `dt_primeiro_cadastro` ou `origem_unificacao` da dimensão introduziria informação futura.
+3. *Vazamento Indireto em Entregas, SAC e Avaliações:*
+   - Em `dw.fato_pedido`, **2.056 clientes** realizaram pedidos até `2025-06-30` cuja entrega efetiva ocorreu após o corte (`data_entrega_sk > '2025-06-30'`).
+   - Em `dw.fato_atendimento`, dos 78.828 chamados com `data_abertura_sk <= '2025-06-30'` para clientes identificados, **13.115 (16,64%)** referenciavam pedidos efetuados após `2025-06-30` (erros de relógio na origem do SAC), restando **65.713 chamados** legitimamente vinculados a pedidos até o corte.
+   - Em `dw.fato_avaliacao`, das 121.160 avaliações com `data_sk <= '2025-06-30'` de clientes identificados, **20.232 (16,70%)** referenciavam pedidos posteriores ao corte, restando **100.928 avaliações** estritamente válidas.
+4. *Clientes Exclusivamente com Pedidos Cancelados:* **2.822 clientes (2,83%)** emitiram pedidos até `2025-06-30`, porém 100% de suas transações até essa data tiveram `status_conformado = 'CANCELADO'` (`frequencia_pedidos = 0`).
+5. *Ausências Estruturais em Médias Condicionais:* **7.088 clientes (7,11%)** não possuíam nenhum pedido com `status_conformado = 'ENTREGUE'` e `data_entrega_sk <= '2025-06-30'`; e **42.974 clientes (43,08%)** não submeteram avaliações até o corte (56.775 clientes avaliaram ao menos um pedido válido).
+
+**Alternativas consideradas:**
+1. *Imputação Global por Zero (`fillna(0)` indiscriminado):* Preencher todas as ausências numéricas com `0`, inclusive `prazo_medio_entrega` e `nota_media_avaliacoes`. Descartada: viola o princípio semântico fundamental (`NaN` não é zero). Imputar `0` em `nota_media_avaliacoes` (escala 1 a 5) equipararia a ausência de avaliação a uma nota pior que a mínima (`1`), e imputar `0` em `prazo_medio_entrega` confundiria pedidos cancelados ou em trânsito com entregas instantâneas no mesmo dia (`0 dias`), distorcendo severamente os pesos da Regressão Logística e os limiares da Árvore de Decisão.
+2. *Imputação Global pela Média ou Mediana na Camada ABT (antes do Split):* Preencher os `NaN` de `prazo_medio_entrega` e `nota_media_avaliacoes` com a mediana ou média global dos 99.749 clientes diretamente no script `04_abt.py`. Descartada: introduziria vazamento metodológico sutil (*imputation leakage*), pois os momentos estatísticos ($\mu, \text{mediana}$) seriam estimados utilizando conjuntamente as instâncias de treino (70%) e de teste (30%) antes da partição no widget `Data Sampler` do Orange Canvas.
+3. *Engenharia com Dupla Trava Temporal, Imputação Semântica por Zero em Contagens e Preservação de `NaN` em Médias Condicionais:*
+   - Declarar o grão canônico: *"Uma linha de `abt.recompra_90d` representa um cliente único identificado (`cliente_sk <> -1`) em uma data de corte específica (`2025-06-30`), com seus atributos comportamentais acumulados até essa data e o indicador binário de recompra nos 90 dias subsequentes."*
+   - Derivar todos os 12 atributos (`recencia_dias`, `frequencia_pedidos`, `valor_monetario_total`, `ticket_medio`, `tempo_como_cliente_dias`, `taxa_cancelamento`, `prazo_medio_entrega`, `categorias_distintas`, `canal_predominante`, `propensao_online`, `qtd_atendimentos_sac`, `nota_media_avaliacoes`) exclusivamente de eventos ocorridos até `2025-06-30`, exigindo dupla trava (`evento <= corte` e `pedido <= corte`) para entregas, SAC e avaliações, e ignorando colunas mutáveis de `dw.dim_cliente`.
+   - Aplicar `0` / `0.00` nas variáveis aditivas e de contagem (`frequencia_pedidos`, `valor_monetario_total`, `ticket_medio`, `categorias_distintas`, `qtd_atendimentos_sac`) e preservar `NaN` (`NULL`) nas variáveis intensivas de média condicional (`prazo_medio_entrega` e `nota_media_avaliacoes`), delegando a imputação para ocorrer estritamente dentro da partição de treino no Orange Canvas. Adotada.
+
+**Decisão:** Alternativa 3.
+
+**Justificativa:** 
+Assegura isolamento temporal absoluto (Princípio 7) e fidelidade estatística na representação do comportamento do consumidor. A dupla trava temporal impede que chamados de SAC ou avaliações com carimbos de data defeituosos tragam sinais de pedidos realizados durante a janela do alvo (`julho a setembro de 2025`), assim como evita usar prazos de entregas concluídas apenas após `30/06/2025`. A separação rigorosa entre zero contábil (contagens e somas financeiras) e `NaN` estrutural (médias condicionais) preserva a geometria dos preditores e garante que os algoritmos do Orange Canvas (Naive Bayes, Regressão Logística e Árvore de Decisão) estimem parâmetros de imputação exclusivamente sobre os 70% de treino, eliminando qualquer contaminação da partição de teste.
+
+**O que se perde:** 
+Perde-se o uso de atributos cadastrais de `dw.dim_cliente` (`dt_primeiro_cadastro` e `origem_unificacao`) por não possuírem versionamento histórico (*Slowly Changing Dimension* Tipo 2) que permita recuperar seu estado exato em `2025-06-30`. Além disso, 2.056 clientes com entregas concluídas após `2025-06-30`, 13.115 registros de SAC e 20.232 avaliações com timestamps anteriores ao corte, mas atrelados a pedidos futuros, têm esses eventos expurgados do cálculo dos atributos preditivos. Por fim, 7.088 clientes permanecem sem valor numérico direto em `prazo_medio_entrega` e 42.974 clientes em `nota_media_avaliacoes`, dependendo do tratamento de `NaN` dos classificadores na etapa de modelagem.
+
+**Registros afetados:** 
+- Universo da ABT (`abt.recompra_90d`): **99.749 clientes reais únicos** (100% da coorte ativa até `2025-06-30`, após exclusão de 1 registro sentinela `cliente_sk = -1`), com **21.711 positivos (21,77%)** e **78.038 negativos (78,23%)**.
+- **2.822 clientes (2,83%)** com apenas pedidos cancelados até o corte tiveram `frequencia_pedidos = 0`, `valor_monetario_total = 0.00`, `ticket_medio = 0.00` e `categorias_distintas = 0`.
+- **46.976 clientes (47,09%)** sem chamados válidos no SAC até o corte receberam `qtd_atendimentos_sac = 0` (52.773 clientes com 1 ou mais chamados, totalizando 65.713 atendimentos válidos).
+- **7.088 clientes (7,11%)** preservaram `NaN` em `prazo_medio_entrega` (92.661 clientes com média calculada).
+- **42.974 clientes (43,08%)** preservaram `NaN` em `nota_media_avaliacoes` (56.775 clientes com média calculada a partir de 100.928 avaliações válidas).
+
+**Asserção associada:** Etapa 04 (`04_abt.py --correta`, suíte `04_abt_correta`), 19 asserções homologadas com 100% de aprovação:
+- `taxa do alvo`: validação de proporção de positivos em `0,2177` dentro do intervalo `[0.02, 0.60]`.
+- `cliente_sk no alvo` e `junção alvo x atributos`: validação de 0 duplicados e preservação estrita da cardinalidade de `99.749` linhas.
+- `total clientes abt sem sentinela` e `ausencia cliente sentinela -1`: confirmação de exatamente `99.749` clientes reais e `0` ocorrências de `cliente_sk = -1`.
+- `recencia_dias sem nulos`, `frequencia_pedidos sem nulos`, `valor_monetario_total sem nulos`, `ticket_medio sem nulos`, `tempo_como_cliente_dias sem nulos`, `taxa_cancelamento sem nulos`, `categorias_distintas sem nulos`, `canal_predominante sem nulos`, `propensao_online sem nulos`, `qtd_atendimentos_sac sem nulos`: validação de `0` nulos nos 10 atributos determinísticos.
+- `dominio canal_predominante`: validação de 100% dos valores dentro de `{'FISICO', 'MARKETPLACE', 'ONLINE_PROPRIO', 'TELEVENDAS'}`.
+- `nulos preservados prazo_medio_entrega` e `nulos preservados nota_media_avaliacoes`: validação exata dos `7.088` e `42.974` `NaN` preservados.
+- `teste_vazamento_amostragem`: auditoria por amostragem de 1.000 clientes (`random_state=20262`) recalculando SQL estrito até `2025-06-30` com `0` divergências.
+
 ---
 
 <br>
@@ -620,7 +672,7 @@ Assume-se que o prefixo `LEG-` nas avaliações do marketplace reflete com 100% 
 | RDT-11 | Declaração de grão duplo (fato_pedido e fato_item_pedido)                             | 410.000 pedidos (fato_pedido) / 1.371.876 itens (fato_item)   | 100,0%                               | Não (preserva a aditividade atômica e agregada de Kimball; exige JOIN entre fatos para consultas combinadas)                                         |
 | RDT-12 | Pedidos sem cliente correspondente (cliente sentinela DESCONHECIDO)                   | 38.699 pedidos (16.183 legado + 22.516 e-commerce)            | 9,44% dos pedidos                    | Sim (perfil demográfico individual perdido; preservados R$ 95.206.869,23 de faturamento corporativo no cliente DESCONHECIDO)                         |
 | RDT-13 | Resolução sintática de produtos e fatos auxiliares (SAC e Avaliações)                 | 40.016 avaliações (SKU legado) + 5.918 SAC (cliente inferido) | 25,0% (avaliações) / 6,2% (SAC)      | Sim (assume-se que LEG-{id} mapeia o ID legado e que o reclamante do SAC é o titular da compra; 1.140 duplicações de protocolo no SAC deduplicadas)  |
-| RDT-14 | Engenharia de atributos da ABT sem vazamento                                          |                                                               |                                      |                                                                                                                                                      |
+| RDT-14 | Engenharia de atributos da ABT sem vazamento                                          | 99.749 clientes reais (2.822 s/ válidos, 7.088 s/ entrega, 42.974 s/ review) | 100,0% da ABT (21,77% positivos) | Sim (atributos cadastrais de dim_cliente descartados por falta de SCD-2; 13.115 SAC e 20.232 reviews de pedidos futuros expurgados; NaN preservados em médias) |
 | RDT-15 | Vazamentos introduzidos deliberadamente                                               |                                                               |                                      |                                                                                                                                                      |
 
 ---
@@ -631,6 +683,14 @@ Responda, com base no que vocês viveram no projeto:
 
 1. Qual das decisões acima mudaria mais o resultado do modelo se tivesse sido
    tomada de outro modo? Vocês testaram, ou é uma hipótese?
+
+   **Resposta:** Fora o isolamento temporal da ABT (RDT-14/RDT-15), a decisão estrutural que mais alteraria o classificador é a **unificação omnichannel por CPF com retenção de dígitos verificadores inválidos (RDT-02)**. **Nós testamos empiricamente no DW:** os 12.539 clientes unificados (`origem_unificacao = 'AMBOS'`) presentes na ABT exibem taxa de recompra de **35,26%** (frequência média de 4,42 pedidos e valor monetário de R$ 10.764,90), contra **20,71%** no e-commerce exclusivo e **17,74%** no legado exclusivo. Sem essa unificação, **10.624 clientes** que compraram em ambos os canais até `2025-06-30` seriam fragmentados em duas linhas com metade da frequência e do gasto real, além de gerar **306 falsos negativos diretos no alvo** (clientes que compraram em um sistema antes do corte e recompraram exclusivamente no outro durante a janela do alvo). Ademais, descartar CPFs matematicamente inválidos destruiria a unificação de **1.130 clientes omnichannel** (cuja taxa de recompra é de **34,42%**, idêntica aos **35,34%** dos CPFs válidos).
+
 2. Alguma decisão que vocês tomaram por conveniência técnica teria consequência
    sobre pessoas reais, se este fosse um sistema em produção? Qual?
+
+   **Resposta:** No **RDT-03**, o desempate da deduplicação do legado pelo maior `ID_CLIENTE` descartou 5.849 cadastros antigos com seus respectivos endereços e telefones; em produção, um cliente com cadastro duplicado que solicitasse garantia ou entrega em um endereço anterior não teria seu vínculo histórico reconhecido. De modo análogo, no **RDT-12 e RDT-14**, a alocação de 38.699 pedidos sem cadastro ao sentinela `CLIENTE DESCONHECIDO` (`cliente_sk = -1`) e sua exclusão da ABT fariam com que compradores reais de balcão fossem ignorados por campanhas de retenção, descontos e programas de fidelidade acionados pelo modelo preditivo.
+
 3. Qual informação vocês gostariam de ter tido, e não tinham?
+
+   **Resposta:** Gostaríamos de dispor de: (i) **histórico temporal de atualizações cadastrais (SCD Tipo 2)** nas origens de clientes, o que permitiria utilizar atributos demográficos e de tempo de cadastro em `dw.dim_cliente` sem o vazamento detectado em 14.878 clientes com `dt_primeiro_cadastro > '2025-06-30'`; (ii) **identificador secundário de pagamento ou programa de fidelidade** para vincular os 38.699 pedidos anônimos (R$ 95,2 milhões) e os ~8% de clientes sem CPF; (iii) **motivo de cancelamento no ERP Legado** (ausente em 15.774 pedidos cancelados no RDT-04) para distinguir desistência voluntária de falha operacional; e (iv) **tabela de filiais com fuso horário oficial** para geolocalizar com exatidão os timestamps sem fuso do legado (RDT-09).
