@@ -651,6 +651,69 @@ Perde-se o uso de atributos cadastrais de `dw.dim_cliente` (`dt_primeiro_cadastr
 - `nulos preservados prazo_medio_entrega` e `nulos preservados nota_media_avaliacoes`: validação exata dos `7.088` e `42.974` `NaN` preservados.
 - `teste_vazamento_amostragem`: auditoria por amostragem de 1.000 clientes (`random_state=20262`) recalculando SQL estrito até `2025-06-30` com `0` divergências.
 
+<br>
+<br>
+
+### Ficha RDT-15 — Vazamentos introduzidos deliberadamente na versão de comparação
+
+**Decisão:** Construção deliberada da tabela-base analítica de contraprova `abt.recompra_90d_vazamento` e exportação do arquivo `saida/abt_recompra_vazamento.csv` contendo a introdução intencional de duas classes distintas de vazamento de dados (*data leakage* / *target leakage*):
+1. *Vazamento Temporal Óbvio (Direto do Alvo):* Supressão do filtro temporal `data_pedido_sk <= DATE '2025-06-30'` no cálculo dos atributos `recencia_dias`, `frequencia_pedidos`, `taxa_cancelamento`, `propensao_online` e na agregação dos fatos auxiliares (SAC e avaliações sobre a base inteira). Pedidos emitidos na janela do alvo (`2025-07-01` a `2025-09-28`) foram incluídos nos atributos comportamentais, gerando recências negativas (`corte - data_pedido < 0`) que entregam explicitamente aos modelos se o cliente recomprou após o corte.
+2. *Vazamento Metodológico Sutil (Pré-processamento Global Pré-Split):* Aplicação de padronização Z-Score $((x - \mu) / \sigma)$ na variável `valor_monetario_total` calculada sobre o conjunto completo de 99.749 clientes antes da partição entre treino (70%) e teste (30%) no Orange Canvas, vazando os momentos estatísticos populacionais da partição de teste para dentro do treinamento.
+
+**Etapa do pipeline:** 04_abt · `monta_atributos_com_vazamento` e fluxos comparativos no Orange Canvas (`orange/fluxo_recompra_vazamento.ows` vs. `orange/fluxo_recompra_correta.ows`).
+
+**O que o dado mostrava:** 
+O perfilamento comparativo entre a versão correta e a versão com vazamento evidenciou as seguintes distorções empíricas:
+1. *Invasão da Janela do Alvo e Recências Negativas:*
+   - Ao estender a agregação de pedidos para além de `2025-06-30`, exatamente **43.434 clientes (43,54%)** apresentaram `recencia_dias < 0` (valores de -1 a -90 dias, correspondentes às compras ocorridas entre 01/07 e 28/09).
+   - Dentre os clientes que recompraram no alvo (`alvo_recompra_90d = 1`), a recência média despencou de **45,3 dias** (na versão correta) para valores fortemente negativos, atuando como um atalho causal (*shortcut learning*) que substitui a modelagem preditiva por mera leitura do alvo futuro.
+2. *Contaminação Estatística Global por Z-Score:*
+   - O valor monetário total bruto médio por cliente acumulado era de R$ 6.326,79 com desvio padrão de R$ 6.134,88.
+   - A padronização Z-score global aplicada antes da separação treino/teste centralizou a média em **0,03** (asserção de QA validada entre `[-0.05, 0.05]`), desvio padrão em **1,00** (`[0.95, 1.05]`) e produziu **56.381 registros com valores negativos**, vazando informação paramétrica da partição de teste que não estaria disponível em produção.
+3. *Auditoria de Divergência Temporal:*
+   - Na amostragem aleatória auditada de 1.000 clientes (`random_state=20262`), **1.000 de 1.000 clientes (100%)** divergiram dos valores calculados estritamente até a data de corte.
+4. *Resultados Comparativos nos Modelos (Orange Canvas · 70% Treino / 30% Teste Estratificado · Semente Fixa `20262`):*
+   - **Árvore de Decisão (Tree):**
+     - *ABT Correta:* AUC = **0,5248** | CA = **0,7769** | F1 = **0,0240** | Precisão = **0,2500** | Recall = **0,0126**
+     - *ABT Vazamento:* AUC = **0,9678** | CA = **0,9218** | F1 = **0,8088** | Precisão = **0,8643** | Recall = **0,7600**
+     - *Diagnóstico:* A árvore identificou o limiar óbvio `recencia_dias < 0` como o primeiro corte (*root split*), atingindo performance quase perfeita ilusória que desmontaria imediatamente ao ser colocada em produção.
+   - **Naive Bayes:**
+     - *ABT Correta:* AUC = **0,5366** | CA = **0,7632** | F1 = **0,1008** | Precisão = **0,2904** | Recall = **0,0610**
+     - *ABT Vazamento:* AUC = **0,8582** | CA = **0,7863** | F1 = **0,5962** | Precisão = **0,5063** | Recall = **0,7250**
+   - **Regressão Logística:**
+     - *ABT Correta:* AUC = **0,5286** | CA = **0,7824** | F1 = **0,0000** | Precisão = **0,0000** | Recall = **0,0000**
+     - *ABT Vazamento:* AUC = **0,8048** | CA = **0,7578** | F1 = **0,2394** | Precisão = **0,3781** | Recall = **0,1752**
+
+**Alternativas consideradas:**
+1. *Vazamento Restrito ao Alvo Temporal Óbvio:* Apenas omitir o filtro temporal nos pedidos, sem introduzir vazamento de pré-processamento. Descartada: embora ilustrasse o salto de AUC na curva ROC, perderia a oportunidade pedagógica essencial de demonstrar o *leakage* metodológico sutil de dados (Z-Score pré-split), que é o erro mais comum e perigoso cometido em competições de ciência de dados e projetos corporativos.
+2. *Vazamento Apenas Estatístico (Z-Score / Imputação Global):* Padronizar dados e imputar pela média antes do split, sem vazamento temporal. Descartada: o ganho isolado de AUC do Z-score global é marginal (da ordem de 0,01 a 0,03) e, sozinho, não ofereceria o contraste visual didático imediato na matriz de confusão e nas curvas ROC exigido no laboratório.
+3. *Engenharia de Duplo Vazamento Controlado (Temporal Óbvio + Metodológico Sutil):* Implementar tanto a invasão da janela futura em `recencia_dias` e `frequencia_pedidos` (produzindo recências negativas e frequência inflada) quanto a padronização Z-score global sobre `valor_monetario_total` antes do particionamento, mantendo idênticos o grão, as chaves de cliente e os nomes de contrato da ABT. Adotada.
+
+**Decisão:** Alternativa 3.
+
+**Justificativa:** 
+O propósito da Engenharia de Dados não é apenas produzir código que roda, mas estabelecer garantias matemáticas e metodológicas de que o artefato gerado possui validade externa. A construção da versão com vazamento cumpre o papel de contraprova empírica controlada: expõe como a ausência de um único predicado SQL (`WHERE data <= corte`) ou a execução descuidada de um escalador estatístico antes da partição cria uma ilusão de excelência preditiva (AUC saltando de ~0,53 para até ~0,97). A análise comparativa no Orange Canvas responde com precisão à pergunta do gabarito docente: se recebêssemos apenas o modelo com vazamento, identificaríamos o erro pela inspeção da importância de variáveis (recência dominando com corte em zero), pela presença de recências negativas na distribuição de atributos e pela divergência temporal na auditoria amostral.
+
+**O que se perde:** 
+Na versão oficial (`abt.recompra_90d`), nenhuma informação foi perdida ou corrompida. Na versão experimental com vazamento (`abt.recompra_90d_vazamento`), perde-se completamente a aplicabilidade prática e a utilidade preditiva do artefato: nenhum cliente do mundo real em tempo de escoragem possui compras futuras registradas, tornando o classificador inoperante e financeiramente perigoso se acionado para campanhas de marketing ou concessão de crédito. Perde-se também a semântica monetária física de `valor_monetario_total`, substituída por escores adimensionais de desvio.
+
+**Registros afetados:** 
+- Universo da ABT com vazamento: **99.749 clientes** (100,0% da coorte).
+- **43.434 clientes (43,54%)** receberam `recencia_dias < 0` (vazamento temporal catastrófico).
+- **99.749 clientes (100,0%)** tiveram `valor_monetario_total` distorcido pelo Z-Score global, resultando em **56.381 registros negativos** e média padronizada em 0,03.
+- **1.000 de 1.000 clientes (100,0%)** da amostra de auditoria apresentaram divergência em relação ao histórico real restrito a `2025-06-30`.
+
+**Asserção associada:** Etapa 04 (`04_abt.py --vazamento`, suíte `04_abt_vazamento`), 21 asserções homologadas com 100% de aprovação:
+- `taxa do alvo`: validação da proporção de positivos em `0,2177` no intervalo `[0.02, 0.60]`.
+- `cliente_sk no alvo`, `junção alvo x atributos`, `total clientes abt sem sentinela`, `ausencia cliente sentinela -1`: validação de 99.749 linhas únicas sem sentinela.
+- Integridade de não-nulos em 10 variáveis determinísticas (`recencia_dias`, `frequencia_pedidos`, `valor_monetario_total`, `ticket_medio`, `tempo_como_cliente_dias`, `taxa_cancelamento`, `categorias_distintas`, `canal_predominante`, `propensao_online`, `qtd_atendimentos_sac`).
+- `dominio canal_predominante`: 100% contido nos 4 canais conformados.
+- `comprovacao_vazamento_recencia_negativa`: validação de exatamente `43.434` clientes com recência negativa ($\ge 1$).
+- `vazamento_zscore_media_zero`: média obtida = `0,03` dentro de `[-0.05, 0.05]`.
+- `vazamento_zscore_desvio_unitario`: desvio padrão obtido = `1,00` dentro de `[0.95, 1.05]`.
+- `vazamento_zscore_valores_negativos`: confirmação de `56.381` instâncias negativas ($\ge 1$).
+- `confirmacao_divergencia_corte_amostragem`: confirmação de `1.000` divergências em 1.000 clientes amostrados ($\ge 1$).
+
 ---
 
 <br>
@@ -673,7 +736,7 @@ Perde-se o uso de atributos cadastrais de `dw.dim_cliente` (`dt_primeiro_cadastr
 | RDT-12 | Pedidos sem cliente correspondente (cliente sentinela DESCONHECIDO)                   | 38.699 pedidos (16.183 legado + 22.516 e-commerce)            | 9,44% dos pedidos                    | Sim (perfil demográfico individual perdido; preservados R$ 95.206.869,23 de faturamento corporativo no cliente DESCONHECIDO)                         |
 | RDT-13 | Resolução sintática de produtos e fatos auxiliares (SAC e Avaliações)                 | 40.016 avaliações (SKU legado) + 5.918 SAC (cliente inferido) | 25,0% (avaliações) / 6,2% (SAC)      | Sim (assume-se que LEG-{id} mapeia o ID legado e que o reclamante do SAC é o titular da compra; 1.140 duplicações de protocolo no SAC deduplicadas)  |
 | RDT-14 | Engenharia de atributos da ABT sem vazamento                                          | 99.749 clientes reais (2.822 s/ válidos, 7.088 s/ entrega, 42.974 s/ review) | 100,0% da ABT (21,77% positivos) | Sim (atributos cadastrais de dim_cliente descartados por falta de SCD-2; 13.115 SAC e 20.232 reviews de pedidos futuros expurgados; NaN preservados em médias) |
-| RDT-15 | Vazamentos introduzidos deliberadamente                                               |                                                               |                                      |                                                                                                                                                      |
+| RDT-15 | Vazamentos introduzidos deliberadamente na versão de comparação                       | 99.749 clientes afetados na ABT vazada (43.434 c/ recência negativa; 100% c/ Z-Score global) | 100,0% da ABT vazada (43,5% vazamento temporal direto) | Não (versão artificial criada de propósito para contraprova metodológica; distorce a semântica de produção)                                         |
 
 ---
 
