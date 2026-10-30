@@ -233,17 +233,172 @@ def monta_atributos_corretos(dw):
 
 def monta_atributos_com_vazamento(dw):
     """
-    TODO 4.2 — reproduza os MESMOS atributos, removendo o filtro de data em
-    pelo menos dois deles (por exemplo recencia_dias e frequencia_pedidos),
-    de modo que passem a enxergar a janela do alvo.
-
-    Acrescente um terceiro vazamento mais sutil: normalize (z-score) um
-    atributo numérico usando média e desvio calculados sobre TODAS as linhas,
-    antes de qualquer partição treino/teste.
-
-    Documente no RDT qual vazamento você introduziu em cada coluna.
+    RDT-15 / TODO 4.2 — Engenharia de atributos com Vazamento Deliberado (Target Leakage).
+    
+    Vazamentos introduzidos de propósito:
+    1. Vazamento Temporal Óbvio em 'recencia_dias' e 'frequencia_pedidos':
+       Remove o filtro 'data_pedido_sk <= DATA_CORTE', permitindo enxergar os
+       pedidos da janela do alvo (01/07/2025 a 28/09/2025). Compras após o corte
+       produzem recencia_dias < 0 e frequencia inflada para os recompradores.
+    2. Vazamento Metodológico Sutil em 'valor_monetario_total':
+       Aplica padronização Z-score (x - media) / desvio calculada sobre as
+       linhas da ABT antes da partição treino/teste, vazando a distribuição
+       estatística do conjunto de teste para o treino.
     """
-    raise NotImplementedError
+    corte_ts = pd.to_datetime(DATA_CORTE)
+
+    # 1. Pedidos da base INTEIRA (sem o filtro data_pedido_sk <= DATA_CORTE)
+    sql_pedidos = text("""
+        SELECT
+            p.pedido_sk,
+            p.cliente_sk,
+            p.data_pedido_sk,
+            p.data_entrega_sk,
+            p.valor_total,
+            p.dias_entrega,
+            s.status_conformado,
+            c.canal_conformado
+        FROM dw.fato_pedido p
+        JOIN dw.dim_status s ON s.status_sk = p.status_sk
+        JOIN dw.dim_canal c ON c.canal_sk = p.canal_sk
+        WHERE p.cliente_sk <> -1
+    """)
+    df_ped = pd.concat(
+        pd.read_sql(sql_pedidos, dw, chunksize=50_000),
+        ignore_index=True
+    )
+
+    # Compras após o corte gerarão valores negativos (ex.: corte - 15/07 = -15 dias)
+    df_ped["dias_desde_pedido"] = (corte_ts - pd.to_datetime(df_ped["data_pedido_sk"])).dt.days
+    df_ped["eh_valido"] = df_ped["status_conformado"] != "CANCELADO"
+    df_ped["eh_cancelado"] = df_ped["status_conformado"] == "CANCELADO"
+    df_ped["eh_online"] = df_ped["canal_conformado"].isin(["ONLINE_PROPRIO", "MARKETPLACE"])
+    df_ped["valor_valido"] = np.where(df_ped["eh_valido"], df_ped["valor_total"].astype(float), 0.0)
+
+    # Prazo de entrega
+    entrega_concluida = (
+        (df_ped["status_conformado"] == "ENTREGUE")
+        & df_ped["data_entrega_sk"].notna()
+    )
+    df_ped["prazo_valido"] = np.where(entrega_concluida, df_ped["dias_entrega"].astype(float), np.nan)
+
+    ag_ped = df_ped.groupby("cliente_sk", as_index=False).agg(
+        recencia_dias=("dias_desde_pedido", "min"),
+        tempo_como_cliente_dias=("dias_desde_pedido", "max"),
+        total_pedidos=("pedido_sk", "count"),
+        frequencia_pedidos=("eh_valido", "sum"),
+        qtd_cancelados=("eh_cancelado", "sum"),
+        qtd_online=("eh_online", "sum"),
+        valor_monetario_total=("valor_valido", "sum"),
+        prazo_medio_entrega=("prazo_valido", "mean"),
+    )
+
+    ag_ped["recencia_dias"] = ag_ped["recencia_dias"].astype(int)
+    ag_ped["tempo_como_cliente_dias"] = ag_ped["tempo_como_cliente_dias"].astype(int)
+    ag_ped["frequencia_pedidos"] = ag_ped["frequencia_pedidos"].astype(int)
+    ag_ped["ticket_medio"] = np.where(
+        ag_ped["frequencia_pedidos"] > 0,
+        (ag_ped["valor_monetario_total"] / ag_ped["frequencia_pedidos"]).round(2),
+        0.0
+    )
+    ag_ped["taxa_cancelamento"] = (ag_ped["qtd_cancelados"] / ag_ped["total_pedidos"]).round(4)
+    ag_ped["propensao_online"] = (ag_ped["qtd_online"] / ag_ped["total_pedidos"]).round(4)
+    ag_ped["prazo_medio_entrega"] = ag_ped["prazo_medio_entrega"].round(2)
+
+    # Vazamento sutil exigido no edital: Z-Score Global antes da partição
+    # Padroniza valor_monetario_total usando a média e o desvio da base inteira
+    media_global = ag_ped["valor_monetario_total"].mean()
+    desvio_global = ag_ped["valor_monetario_total"].std()
+    ag_ped["valor_monetario_total"] = (
+        (ag_ped["valor_monetario_total"] - media_global) / desvio_global
+    ).round(4)
+
+    # Canal predominante
+    cont_canal = (
+        df_ped.groupby(["cliente_sk", "canal_conformado"], as_index=False)["pedido_sk"]
+        .count()
+        .sort_values(["cliente_sk", "pedido_sk", "canal_conformado"], ascending=[True, False, True])
+        .drop_duplicates(subset=["cliente_sk"], keep="first")
+        .rename(columns={"canal_conformado": "canal_predominante"})[["cliente_sk", "canal_predominante"]]
+    )
+    ag_ped = ag_ped.merge(cont_canal, on="cliente_sk", how="left")
+
+    # 2. Diversidade de categorias (itens válidos da base)
+    sql_itens = text("""
+        SELECT p.cliente_sk, pr.categoria_nivel1
+        FROM dw.fato_item_pedido i
+        JOIN dw.fato_pedido p ON p.pedido_sk = i.pedido_sk
+        JOIN dw.dim_status s ON s.status_sk = p.status_sk
+        JOIN dw.dim_produto pr ON pr.produto_sk = i.produto_sk
+        WHERE p.cliente_sk <> -1
+          AND s.status_conformado <> 'CANCELADO'
+    """)
+    pares_cat = []
+    for chunk in pd.read_sql(sql_itens, dw, chunksize=50_000):
+        pares_cat.append(chunk.drop_duplicates())
+    df_cat_unicos = pd.concat(pares_cat, ignore_index=True).drop_duplicates()
+    ag_cat = (
+        df_cat_unicos.groupby("cliente_sk", as_index=False)["categoria_nivel1"]
+        .nunique()
+        .rename(columns={"categoria_nivel1": "categorias_distintas"})
+    )
+    ag_ped = ag_ped.merge(ag_cat, on="cliente_sk", how="left")
+    ag_ped["categorias_distintas"] = ag_ped["categorias_distintas"].fillna(0).astype(int)
+
+    # 3. SAC (base inteira)
+    sql_sac = text("""
+        SELECT a.cliente_sk, a.atendimento_sk
+        FROM dw.fato_atendimento a
+        JOIN dw.fato_pedido p ON p.pedido_sk = a.pedido_sk
+        WHERE a.cliente_sk <> -1
+    """)
+    df_sac = pd.concat(
+        pd.read_sql(sql_sac, dw, chunksize=50_000),
+        ignore_index=True
+    )
+    ag_sac = (
+        df_sac.groupby("cliente_sk", as_index=False)["atendimento_sk"]
+        .count()
+        .rename(columns={"atendimento_sk": "qtd_atendimentos_sac"})
+    )
+    ag_ped = ag_ped.merge(ag_sac, on="cliente_sk", how="left")
+    ag_ped["qtd_atendimentos_sac"] = ag_ped["qtd_atendimentos_sac"].fillna(0).astype(int)
+
+    # 4. Avaliações (base inteira)
+    sql_aval = text("""
+        SELECT p.cliente_sk, av.nota
+        FROM dw.fato_avaliacao av
+        JOIN dw.fato_pedido p ON p.pedido_sk = av.pedido_sk
+        WHERE p.cliente_sk <> -1
+    """)
+    df_aval = pd.concat(
+        pd.read_sql(sql_aval, dw, chunksize=50_000),
+        ignore_index=True
+    )
+    ag_aval = (
+        df_aval.groupby("cliente_sk", as_index=False)["nota"]
+        .mean()
+        .rename(columns={"nota": "nota_media_avaliacoes"})
+    )
+    ag_aval["nota_media_avaliacoes"] = ag_aval["nota_media_avaliacoes"].round(2)
+    ag_ped = ag_ped.merge(ag_aval, on="cliente_sk", how="left")
+
+    colunas_contrato = [
+        "cliente_sk",
+        "recencia_dias",
+        "frequencia_pedidos",
+        "valor_monetario_total",
+        "ticket_medio",
+        "tempo_como_cliente_dias",
+        "taxa_cancelamento",
+        "prazo_medio_entrega",
+        "categorias_distintas",
+        "canal_predominante",
+        "propensao_online",
+        "qtd_atendimentos_sac",
+        "nota_media_avaliacoes",
+    ]
+    return ag_ped[colunas_contrato]
 
 
 def grava(df, dw, sufixo):
@@ -342,6 +497,88 @@ if __name__ == "__main__":
             divergencias_corte,
             0,
             "Nenhum cliente amostrado pode divergir do calculo estrito ate a data de corte",
+        )
+
+    elif args.vazamento:
+        qa.sem_nulos("recencia_dias sem nulos", abt["recencia_dias"])
+        qa.sem_nulos("frequencia_pedidos sem nulos", abt["frequencia_pedidos"])
+        qa.sem_nulos("valor_monetario_total sem nulos", abt["valor_monetario_total"])
+        qa.sem_nulos("ticket_medio sem nulos", abt["ticket_medio"])
+        qa.sem_nulos("tempo_como_cliente_dias sem nulos", abt["tempo_como_cliente_dias"])
+        qa.sem_nulos("taxa_cancelamento sem nulos", abt["taxa_cancelamento"])
+        qa.sem_nulos("categorias_distintas sem nulos", abt["categorias_distintas"])
+        qa.sem_nulos("canal_predominante sem nulos", abt["canal_predominante"])
+        qa.sem_nulos("propensao_online sem nulos", abt["propensao_online"])
+        qa.sem_nulos("qtd_atendimentos_sac sem nulos", abt["qtd_atendimentos_sac"])
+        qa.dominio(
+            "dominio canal_predominante",
+            abt["canal_predominante"],
+            {"FISICO", "ONLINE_PROPRIO", "MARKETPLACE", "TELEVENDAS"},
+            "canal_predominante deve pertencer aos 4 canais conformados do DW",
+        )
+
+        # Asserções comprobatórias de Target Leakage (TODO 4.2 / RDT-15):
+        # 1. Vazamento temporal clássico: recências negativas por enxergar pedidos pós-corte
+        recompra_futura = int((abt["recencia_dias"] < 0).sum())
+        qa.maior_igual(
+            "comprovacao_vazamento_recencia_negativa",
+            recompra_futura,
+            1,
+            "Presença de recência negativa comprova inclusão de pedidos da janela do alvo",
+        )
+
+        # 2. Vazamento metodológico sutil: normalização Z-Score global sobre toda a base
+        media_zscore = round(float(abt["valor_monetario_total"].mean()), 2)
+        desvio_zscore = round(float(abt["valor_monetario_total"].std()), 2)
+        qa.entre(
+            "vazamento_zscore_media_zero",
+            media_zscore,
+            -0.05,
+            0.05,
+            "Média em torno de 0 comprova padronização Z-score global antes do split",
+        )
+        qa.entre(
+            "vazamento_zscore_desvio_unitario",
+            desvio_zscore,
+            0.95,
+            1.05,
+            "Desvio padrão em torno de 1 comprova padronização Z-score global antes do split",
+        )
+        qa.maior_igual(
+            "vazamento_zscore_valores_negativos",
+            int((abt["valor_monetario_total"] < 0).sum()),
+            1,
+            "Presença de valores monetários negativos confirma padronização Z-score",
+        )
+
+        # 3. Auditoria por amostragem: na versão com vazamento, DEVE haver divergência
+        amostra_sks = tuple(abt["cliente_sk"].sample(n=1_000, random_state=20262).tolist())
+        sql_auditoria_corte = text(f"""
+            SELECT
+                p.cliente_sk,
+                (DATE '{DATA_CORTE}' - MAX(p.data_pedido_sk))::int AS rec_sql,
+                COUNT(*) FILTER (WHERE s.status_conformado <> 'CANCELADO')::int AS freq_sql,
+                COALESCE(ROUND(SUM(p.valor_total) FILTER (WHERE s.status_conformado <> 'CANCELADO'), 2), 0.0) AS val_sql
+            FROM dw.fato_pedido p
+            JOIN dw.dim_status s ON s.status_sk = p.status_sk
+            WHERE p.data_pedido_sk <= DATE '{DATA_CORTE}'
+              AND p.cliente_sk IN :sks
+            GROUP BY p.cliente_sk
+        """)
+        df_aud = pd.read_sql(sql_auditoria_corte, dw, params={"sks": amostra_sks})
+        comp = abt.merge(df_aud, on="cliente_sk", how="inner")
+        divergencias_corte = int(
+            (
+                (comp["recencia_dias"] != comp["rec_sql"])
+                | (comp["frequencia_pedidos"] != comp["freq_sql"])
+                | ((comp["valor_monetario_total"] - comp["val_sql"]).abs() > 0.01)
+            ).sum()
+        )
+        qa.maior_igual(
+            "confirmacao_divergencia_corte_amostragem",
+            divergencias_corte,
+            1,
+            "ABT com vazamento deve divergir dos cálculos restritos à data de corte",
         )
 
     grava(abt, dw, "correta" if args.correta else "vazamento")
