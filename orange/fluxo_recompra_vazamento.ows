@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<scheme version="2.0" title="Experimento de Recompra 90d — ABT Correta (Sem Vazamento)" description="Fluxo experimental canônico (RDT-14): File -&gt; Data Sampler (70/30 estratificado, semente fixa) -&gt; Naive Bayes, Logistic Regression, Tree -&gt; Test &amp; Score (Test on Test Data) -&gt; Confusion Matrix e ROC Analysis.">
+<scheme version="2.0" title="Experimento de Recompra 90d — ABT com Vazamento" description="Fluxo experimental de contraprova (RDT-15): File -&gt; Data Sampler (70/30 estratificado, semente fixa) -&gt; Naive Bayes, Logistic Regression, Tree -&gt; Test &amp; Score (Test on Test Data) -&gt; Confusion Matrix e ROC Analysis.">
 	<nodes>
 		<node id="0" name="File" qualified_name="Orange.widgets.data.owfile.OWFile" project_name="Orange3" version="" title="File (ABT Vazamento)" position="(80.0, 260.0)" />
 		<node id="1" name="Data Sampler" qualified_name="Orange.widgets.data.owdatasampler.OWDataSampler" project_name="Orange3" version="" title="Data Sampler (70/30 Estratificado)" position="(260.0, 260.0)" />
