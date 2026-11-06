@@ -227,12 +227,14 @@ def unifica_clientes(qa):
             SELECT 1 FROM dw.dim_cliente dest 
             WHERE dest.cpf_normalizado = src.cpf_normalizado
         );
-
-        DROP TABLE IF EXISTS dw.temp_dim_cliente;
     """)
 
-    with dw.begin() as conn:
-        conn.execute(upsert_sql)
+    try:
+        with dw.begin() as conn:
+            conn.execute(upsert_sql)
+    finally:
+        with dw.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS dw.temp_dim_cliente;"))
 
     # Asserções obrigatórias
     qa.sem_nulos("nome_padronizado preenchido", dim_cliente["nome_padronizado"])
@@ -284,27 +286,33 @@ def conforma_status(qa):
         {"status_origem": "CANCELADO", "sistema": "LEGADO", "status_conformado": "CANCELADO", "motivo_cancelamento": None},
 
         # E-commerce
-        {"status_origem": "delivered", "sistema": "ECOMMERCE", "status_conformado": "ENTREGUE", "motivo_cancelamento": None},
-        {"status_origem": "shipped", "sistema": "ECOMMERCE", "status_conformado": "EM_TRANSITO", "motivo_cancelamento": None},
-        {"status_origem": "processing", "sistema": "ECOMMERCE", "status_conformado": "PROCESSAMENTO", "motivo_cancelamento": None},
-        {"status_origem": "canceled", "sistema": "ECOMMERCE", "status_conformado": "CANCELADO", "motivo_cancelamento": "DESISTENCIA_CLIENTE"},
-        {"status_origem": "payment_declined", "sistema": "ECOMMERCE", "status_conformado": "CANCELADO", "motivo_cancelamento": "RECUSA_PAGAMENTO"}
+        {"status_origem": "delivered", "sistema": "ECOM", "status_conformado": "ENTREGUE", "motivo_cancelamento": None},
+        {"status_origem": "shipped", "sistema": "ECOM", "status_conformado": "EM_TRANSITO", "motivo_cancelamento": None},
+        {"status_origem": "processing", "sistema": "ECOM", "status_conformado": "PROCESSAMENTO", "motivo_cancelamento": None},
+        {"status_origem": "canceled", "sistema": "ECOM", "status_conformado": "CANCELADO", "motivo_cancelamento": "DESISTENCIA_CLIENTE"},
+        {"status_origem": "payment_declined", "sistema": "ECOM", "status_conformado": "CANCELADO", "motivo_cancelamento": "RECUSA_PAGAMENTO"}
     ]
     
     df_status = pd.DataFrame(dados_status)
 
-    # Gravação na dimensão
+    # Gravação na dimensão via UPSERT idempotente para não disparar CASCADE acidental
+    upsert_status_sql = text("""
+        INSERT INTO dw.dim_status (status_origem, sistema, status_conformado, motivo_cancelamento)
+        VALUES (:status_origem, :sistema, :status_conformado, :motivo_cancelamento)
+        ON CONFLICT (status_origem, sistema) DO UPDATE
+        SET status_conformado = EXCLUDED.status_conformado,
+            motivo_cancelamento = EXCLUDED.motivo_cancelamento;
+    """)
     with dw.begin() as conn:
-        conn.execute(text("TRUNCATE dw.dim_status RESTART IDENTITY CASCADE;"))
-    
-    df_status.to_sql("dim_status", dw, schema="dw", if_exists="append", index=False)
+        for item in dados_status:
+            conn.execute(upsert_status_sql, item)
     print("-> Gravando dw.dim_status...")
 
     # Contagem de pedidos por status para subsidiar o RDT-04
     pedidos_leg = pd.read_sql('SELECT "STATUS" as status_origem, COUNT(*) as qtd_pedidos FROM stg.legado_pedidos GROUP BY "STATUS"', dw)
     pedidos_leg["sistema"] = "LEGADO"
     pedidos_ecom = pd.read_sql("SELECT status as status_origem, COUNT(*) as qtd_pedidos FROM stg.ecommerce_orders GROUP BY status", dw)
-    pedidos_ecom["sistema"] = "ECOMMERCE"
+    pedidos_ecom["sistema"] = "ECOM"
     df_qtd = pd.concat([pedidos_leg, pedidos_ecom], ignore_index=True)
     resumo = pd.merge(df_status, df_qtd, on=["status_origem", "sistema"], how="left")
     
@@ -526,16 +534,16 @@ def conforma_categorias(qa):
             SELECT 
                 pr.sku,
                 pr.title as descricao,
-                COALESCE(pai.name, c.name) as categoria_nivel1,
-                CASE WHEN pai.name IS NOT NULL THEN c.name ELSE 'Geral' END as categoria_nivel2,
-                c.name as categoria_origem,
+                COALESCE(pai.name, c.name, 'Geral') as categoria_nivel1,
+                CASE WHEN pai.name IS NOT NULL THEN c.name ELSE COALESCE(c.name, 'Geral') END as categoria_nivel2,
+                COALESCE(c.name, '') as categoria_origem,
                 pr.list_price::numeric(12,2) as preco_referencia,
                 pr.active as ativo,
                 NULL::int as id_legado,
                 pr.product_id as id_ecommerce,
                 'ECOM' as origem
             FROM stg.ecommerce_product pr
-            JOIN stg.ecommerce_category c ON pr.category_id = c.category_id
+            LEFT JOIN stg.ecommerce_category c ON pr.category_id = c.category_id
             LEFT JOIN stg.ecommerce_category pai ON c.parent_id = pai.category_id;
         """))
 
@@ -580,8 +588,8 @@ def conforma_categorias(qa):
                     WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('FONE', 'CARREGADOR', 'CAPA', 'SMARTWATCH') THEN 'Acessórios de Telefonia'
                     WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SOFÁ', 'CADEIRA', 'MESA', 'ESTANTE') THEN 'Móveis'
                     WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('COLCHÃO', 'LENÇOL', 'TOALHA') THEN 'Cama, Mesa e Banho'
-                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('BICICLETA', 'ESTEIRA', 'HALTER') THEN 'Geral'
-                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('FURADEIRA', 'PARAFUSADEIRA', 'SERRA') THEN 'Geral'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('BICICLETA', 'ESTEIRA', 'HALTER') THEN 'Esporte e Lazer'
+                    WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('FURADEIRA', 'PARAFUSADEIRA', 'SERRA') THEN 'Ferramentas'
                     WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('TELEVISOR') THEN 'Televisores'
                     WHEN SPLIT_PART(UPPER("DESCRICAO"), ' ', 1) IN ('SOUNDBAR', 'CAIXA', 'RECEIVER', 'HEADPHONE') THEN 'Áudio'
                     ELSE 'Geral'

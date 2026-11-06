@@ -69,15 +69,16 @@ LEFT JOIN compras_na_janela j ON j.cliente_sk = b.cliente_sk
 """
 
 
-def monta_atributos_corretos(dw):
+def monta_atributos(dw, com_vazamento=False):
     """
-    RDT-14 — Engenharia de atributos preditivos da ABT Correta via Pandas.
-    Todo evento e agregado respeita estritamente a barreira temporal
-    data_pedido_sk <= DATE '{DATA_CORTE}' e exclui a chave sentinela (-1).
+    Engenharia de atributos preditivos da ABT (RDT-14 e RDT-15).
+    - com_vazamento=False: atributos calculados estritamente até DATA_CORTE (versão correta).
+    - com_vazamento=True: supressão do corte temporal e Z-Score global (versão com vazamento deliberado).
     """
     corte_ts = pd.to_datetime(DATA_CORTE)
+    filtro_corte = f"AND p.data_pedido_sk <= DATE '{DATA_CORTE}'" if not com_vazamento else ""
 
-    # 1. Pedidos emitidos até a data de corte (leitura em lotes de 50.000 linhas)
+    # 1. Pedidos (lidos via chunks controlados)
     sql_pedidos = text(f"""
         SELECT
             p.pedido_sk,
@@ -91,8 +92,8 @@ def monta_atributos_corretos(dw):
         FROM dw.fato_pedido p
         JOIN dw.dim_status s ON s.status_sk = p.status_sk
         JOIN dw.dim_canal c ON c.canal_sk = p.canal_sk
-        WHERE p.data_pedido_sk <= DATE '{DATA_CORTE}'
-          AND p.cliente_sk <> -1
+        WHERE p.cliente_sk <> -1
+          {filtro_corte}
     """)
     df_ped = pd.concat(
         pd.read_sql(sql_pedidos, dw, chunksize=50_000),
@@ -105,14 +106,19 @@ def monta_atributos_corretos(dw):
     df_ped["eh_online"] = df_ped["canal_conformado"].isin(["ONLINE_PROPRIO", "MARKETPLACE"])
     df_ped["valor_valido"] = np.where(df_ped["eh_valido"], df_ped["valor_total"].astype(float), 0.0)
 
-    # Dupla trava temporal para entrega: o pedido deve estar ENTREGUE e a entrega
-    # precisa ter ocorrido até a data de corte (entregas após 30/06 seriam futuro).
-    entrega_ate_corte = (
-        (df_ped["status_conformado"] == "ENTREGUE")
-        & df_ped["data_entrega_sk"].notna()
-        & (pd.to_datetime(df_ped["data_entrega_sk"]) <= corte_ts)
-    )
-    df_ped["prazo_valido"] = np.where(entrega_ate_corte, df_ped["dias_entrega"].astype(float), np.nan)
+    # Prazo de entrega
+    if not com_vazamento:
+        entrega_valida = (
+            (df_ped["status_conformado"] == "ENTREGUE")
+            & df_ped["data_entrega_sk"].notna()
+            & (pd.to_datetime(df_ped["data_entrega_sk"]) <= corte_ts)
+        )
+    else:
+        entrega_valida = (
+            (df_ped["status_conformado"] == "ENTREGUE")
+            & df_ped["data_entrega_sk"].notna()
+        )
+    df_ped["prazo_valido"] = np.where(entrega_valida, df_ped["dias_entrega"].astype(float), np.nan)
 
     ag_ped = df_ped.groupby("cliente_sk", as_index=False).agg(
         recencia_dias=("dias_desde_pedido", "min"),
@@ -138,180 +144,12 @@ def monta_atributos_corretos(dw):
     ag_ped["propensao_online"] = (ag_ped["qtd_online"] / ag_ped["total_pedidos"]).round(4)
     ag_ped["prazo_medio_entrega"] = ag_ped["prazo_medio_entrega"].round(2)
 
-    # Canal predominante (moda de canal_conformado por cliente, desempate alfabético)
-    cont_canal = (
-        df_ped.groupby(["cliente_sk", "canal_conformado"], as_index=False)["pedido_sk"]
-        .count()
-        .sort_values(["cliente_sk", "pedido_sk", "canal_conformado"], ascending=[True, False, True])
-        .drop_duplicates(subset=["cliente_sk"], keep="first")
-        .rename(columns={"canal_conformado": "canal_predominante"})[["cliente_sk", "canal_predominante"]]
-    )
-    ag_ped = ag_ped.merge(cont_canal, on="cliente_sk", how="left")
-
-    # 2. Diversidade de sortimento (categorias_distintas em fato_item_pedido via chunks)
-    sql_itens = text(f"""
-        SELECT p.cliente_sk, pr.categoria_nivel1
-        FROM dw.fato_item_pedido i
-        JOIN dw.fato_pedido p ON p.pedido_sk = i.pedido_sk
-        JOIN dw.dim_status s ON s.status_sk = p.status_sk
-        JOIN dw.dim_produto pr ON pr.produto_sk = i.produto_sk
-        WHERE p.data_pedido_sk <= DATE '{DATA_CORTE}'
-          AND p.cliente_sk <> -1
-          AND s.status_conformado <> 'CANCELADO'
-    """)
-    pares_cat = []
-    for chunk in pd.read_sql(sql_itens, dw, chunksize=50_000):
-        pares_cat.append(chunk.drop_duplicates())
-    df_cat_unicos = pd.concat(pares_cat, ignore_index=True).drop_duplicates()
-    ag_cat = (
-        df_cat_unicos.groupby("cliente_sk", as_index=False)["categoria_nivel1"]
-        .nunique()
-        .rename(columns={"categoria_nivel1": "categorias_distintas"})
-    )
-    ag_ped = ag_ped.merge(ag_cat, on="cliente_sk", how="left")
-    ag_ped["categorias_distintas"] = ag_ped["categorias_distintas"].fillna(0).astype(int)
-
-    # 3. Fato auxiliar SAC (dupla trava temporal: abertura <= corte E pedido <= corte)
-    sql_sac = text(f"""
-        SELECT a.cliente_sk, a.atendimento_sk
-        FROM dw.fato_atendimento a
-        JOIN dw.fato_pedido p ON p.pedido_sk = a.pedido_sk
-        WHERE a.data_abertura_sk <= DATE '{DATA_CORTE}'
-          AND p.data_pedido_sk <= DATE '{DATA_CORTE}'
-          AND a.cliente_sk <> -1
-    """)
-    df_sac = pd.concat(
-        pd.read_sql(sql_sac, dw, chunksize=50_000),
-        ignore_index=True
-    )
-    ag_sac = (
-        df_sac.groupby("cliente_sk", as_index=False)["atendimento_sk"]
-        .count()
-        .rename(columns={"atendimento_sk": "qtd_atendimentos_sac"})
-    )
-    ag_ped = ag_ped.merge(ag_sac, on="cliente_sk", how="left")
-    ag_ped["qtd_atendimentos_sac"] = ag_ped["qtd_atendimentos_sac"].fillna(0).astype(int)
-
-    # 4. Fato auxiliar Avaliações (dupla trava temporal: review <= corte E pedido <= corte)
-    sql_aval = text(f"""
-        SELECT p.cliente_sk, av.nota
-        FROM dw.fato_avaliacao av
-        JOIN dw.fato_pedido p ON p.pedido_sk = av.pedido_sk
-        WHERE av.data_sk <= DATE '{DATA_CORTE}'
-          AND p.data_pedido_sk <= DATE '{DATA_CORTE}'
-          AND p.cliente_sk <> -1
-    """)
-    df_aval = pd.concat(
-        pd.read_sql(sql_aval, dw, chunksize=50_000),
-        ignore_index=True
-    )
-    ag_aval = (
-        df_aval.groupby("cliente_sk", as_index=False)["nota"]
-        .mean()
-        .rename(columns={"nota": "nota_media_avaliacoes"})
-    )
-    ag_aval["nota_media_avaliacoes"] = ag_aval["nota_media_avaliacoes"].round(2)
-    ag_ped = ag_ped.merge(ag_aval, on="cliente_sk", how="left")
-
-    colunas_contrato = [
-        "cliente_sk",
-        "recencia_dias",
-        "frequencia_pedidos",
-        "valor_monetario_total",
-        "ticket_medio",
-        "tempo_como_cliente_dias",
-        "taxa_cancelamento",
-        "prazo_medio_entrega",
-        "categorias_distintas",
-        "canal_predominante",
-        "propensao_online",
-        "qtd_atendimentos_sac",
-        "nota_media_avaliacoes",
-    ]
-    return ag_ped[colunas_contrato]
-
-
-def monta_atributos_com_vazamento(dw):
-    """
-    RDT-15 / TODO 4.2 — Engenharia de atributos com Vazamento Deliberado (Target Leakage).
-    
-    Vazamentos introduzidos de propósito:
-    1. Vazamento Temporal Óbvio em 'recencia_dias' e 'frequencia_pedidos':
-       Remove o filtro 'data_pedido_sk <= DATA_CORTE', permitindo enxergar os
-       pedidos da janela do alvo (01/07/2025 a 28/09/2025). Compras após o corte
-       produzem recencia_dias < 0 e frequencia inflada para os recompradores.
-    2. Vazamento Metodológico Sutil em 'valor_monetario_total':
-       Aplica padronização Z-score (x - media) / desvio calculada sobre as
-       linhas da ABT antes da partição treino/teste, vazando a distribuição
-       estatística do conjunto de teste para o treino.
-    """
-    corte_ts = pd.to_datetime(DATA_CORTE)
-
-    # 1. Pedidos da base INTEIRA (sem o filtro data_pedido_sk <= DATA_CORTE)
-    sql_pedidos = text("""
-        SELECT
-            p.pedido_sk,
-            p.cliente_sk,
-            p.data_pedido_sk,
-            p.data_entrega_sk,
-            p.valor_total,
-            p.dias_entrega,
-            s.status_conformado,
-            c.canal_conformado
-        FROM dw.fato_pedido p
-        JOIN dw.dim_status s ON s.status_sk = p.status_sk
-        JOIN dw.dim_canal c ON c.canal_sk = p.canal_sk
-        WHERE p.cliente_sk <> -1
-    """)
-    df_ped = pd.concat(
-        pd.read_sql(sql_pedidos, dw, chunksize=50_000),
-        ignore_index=True
-    )
-
-    # Compras após o corte gerarão valores negativos (ex.: corte - 15/07 = -15 dias)
-    df_ped["dias_desde_pedido"] = (corte_ts - pd.to_datetime(df_ped["data_pedido_sk"])).dt.days
-    df_ped["eh_valido"] = df_ped["status_conformado"] != "CANCELADO"
-    df_ped["eh_cancelado"] = df_ped["status_conformado"] == "CANCELADO"
-    df_ped["eh_online"] = df_ped["canal_conformado"].isin(["ONLINE_PROPRIO", "MARKETPLACE"])
-    df_ped["valor_valido"] = np.where(df_ped["eh_valido"], df_ped["valor_total"].astype(float), 0.0)
-
-    # Prazo de entrega
-    entrega_concluida = (
-        (df_ped["status_conformado"] == "ENTREGUE")
-        & df_ped["data_entrega_sk"].notna()
-    )
-    df_ped["prazo_valido"] = np.where(entrega_concluida, df_ped["dias_entrega"].astype(float), np.nan)
-
-    ag_ped = df_ped.groupby("cliente_sk", as_index=False).agg(
-        recencia_dias=("dias_desde_pedido", "min"),
-        tempo_como_cliente_dias=("dias_desde_pedido", "max"),
-        total_pedidos=("pedido_sk", "count"),
-        frequencia_pedidos=("eh_valido", "sum"),
-        qtd_cancelados=("eh_cancelado", "sum"),
-        qtd_online=("eh_online", "sum"),
-        valor_monetario_total=("valor_valido", "sum"),
-        prazo_medio_entrega=("prazo_valido", "mean"),
-    )
-
-    ag_ped["recencia_dias"] = ag_ped["recencia_dias"].astype(int)
-    ag_ped["tempo_como_cliente_dias"] = ag_ped["tempo_como_cliente_dias"].astype(int)
-    ag_ped["frequencia_pedidos"] = ag_ped["frequencia_pedidos"].astype(int)
-    ag_ped["ticket_medio"] = np.where(
-        ag_ped["frequencia_pedidos"] > 0,
-        (ag_ped["valor_monetario_total"] / ag_ped["frequencia_pedidos"]).round(2),
-        0.0
-    )
-    ag_ped["taxa_cancelamento"] = (ag_ped["qtd_cancelados"] / ag_ped["total_pedidos"]).round(4)
-    ag_ped["propensao_online"] = (ag_ped["qtd_online"] / ag_ped["total_pedidos"]).round(4)
-    ag_ped["prazo_medio_entrega"] = ag_ped["prazo_medio_entrega"].round(2)
-
-    # Vazamento sutil exigido no edital: Z-Score Global antes da partição
-    # Padroniza valor_monetario_total usando a média e o desvio da base inteira
-    media_global = ag_ped["valor_monetario_total"].mean()
-    desvio_global = ag_ped["valor_monetario_total"].std()
-    ag_ped["valor_monetario_total"] = (
-        (ag_ped["valor_monetario_total"] - media_global) / desvio_global
-    ).round(4)
+    if com_vazamento:
+        media_global = ag_ped["valor_monetario_total"].mean()
+        desvio_global = ag_ped["valor_monetario_total"].std()
+        ag_ped["valor_monetario_total"] = (
+            (ag_ped["valor_monetario_total"] - media_global) / desvio_global
+        ).round(4)
 
     # Canal predominante
     cont_canal = (
@@ -323,64 +161,48 @@ def monta_atributos_com_vazamento(dw):
     )
     ag_ped = ag_ped.merge(cont_canal, on="cliente_sk", how="left")
 
-    # 2. Diversidade de categorias (itens válidos da base)
-    sql_itens = text("""
-        SELECT p.cliente_sk, pr.categoria_nivel1
+    # 2. Diversidade de categorias (otimizada via SQL nativo)
+    filtro_cat = f"AND p.data_pedido_sk <= DATE '{DATA_CORTE}'" if not com_vazamento else ""
+    sql_itens = text(f"""
+        SELECT p.cliente_sk, COUNT(DISTINCT pr.categoria_nivel1)::int AS categorias_distintas
         FROM dw.fato_item_pedido i
         JOIN dw.fato_pedido p ON p.pedido_sk = i.pedido_sk
         JOIN dw.dim_status s ON s.status_sk = p.status_sk
         JOIN dw.dim_produto pr ON pr.produto_sk = i.produto_sk
         WHERE p.cliente_sk <> -1
           AND s.status_conformado <> 'CANCELADO'
+          {filtro_cat}
+        GROUP BY p.cliente_sk
     """)
-    pares_cat = []
-    for chunk in pd.read_sql(sql_itens, dw, chunksize=50_000):
-        pares_cat.append(chunk.drop_duplicates())
-    df_cat_unicos = pd.concat(pares_cat, ignore_index=True).drop_duplicates()
-    ag_cat = (
-        df_cat_unicos.groupby("cliente_sk", as_index=False)["categoria_nivel1"]
-        .nunique()
-        .rename(columns={"categoria_nivel1": "categorias_distintas"})
-    )
+    ag_cat = pd.read_sql(sql_itens, dw)
     ag_ped = ag_ped.merge(ag_cat, on="cliente_sk", how="left")
     ag_ped["categorias_distintas"] = ag_ped["categorias_distintas"].fillna(0).astype(int)
 
-    # 3. SAC (base inteira)
-    sql_sac = text("""
-        SELECT a.cliente_sk, a.atendimento_sk
+    # 3. Fato auxiliar SAC (otimizada via SQL nativo)
+    filtro_sac = f"AND a.data_abertura_sk <= DATE '{DATA_CORTE}' AND p.data_pedido_sk <= DATE '{DATA_CORTE}'" if not com_vazamento else ""
+    sql_sac = text(f"""
+        SELECT a.cliente_sk, COUNT(*)::int AS qtd_atendimentos_sac
         FROM dw.fato_atendimento a
         JOIN dw.fato_pedido p ON p.pedido_sk = a.pedido_sk
         WHERE a.cliente_sk <> -1
+          {filtro_sac}
+        GROUP BY a.cliente_sk
     """)
-    df_sac = pd.concat(
-        pd.read_sql(sql_sac, dw, chunksize=50_000),
-        ignore_index=True
-    )
-    ag_sac = (
-        df_sac.groupby("cliente_sk", as_index=False)["atendimento_sk"]
-        .count()
-        .rename(columns={"atendimento_sk": "qtd_atendimentos_sac"})
-    )
+    ag_sac = pd.read_sql(sql_sac, dw)
     ag_ped = ag_ped.merge(ag_sac, on="cliente_sk", how="left")
     ag_ped["qtd_atendimentos_sac"] = ag_ped["qtd_atendimentos_sac"].fillna(0).astype(int)
 
-    # 4. Avaliações (base inteira)
-    sql_aval = text("""
-        SELECT p.cliente_sk, av.nota
+    # 4. Fato auxiliar Avaliações (otimizada via SQL nativo)
+    filtro_aval = f"AND av.data_sk <= DATE '{DATA_CORTE}' AND p.data_pedido_sk <= DATE '{DATA_CORTE}'" if not com_vazamento else ""
+    sql_aval = text(f"""
+        SELECT p.cliente_sk, ROUND(AVG(av.nota), 2)::float AS nota_media_avaliacoes
         FROM dw.fato_avaliacao av
         JOIN dw.fato_pedido p ON p.pedido_sk = av.pedido_sk
         WHERE p.cliente_sk <> -1
+          {filtro_aval}
+        GROUP BY p.cliente_sk
     """)
-    df_aval = pd.concat(
-        pd.read_sql(sql_aval, dw, chunksize=50_000),
-        ignore_index=True
-    )
-    ag_aval = (
-        df_aval.groupby("cliente_sk", as_index=False)["nota"]
-        .mean()
-        .rename(columns={"nota": "nota_media_avaliacoes"})
-    )
-    ag_aval["nota_media_avaliacoes"] = ag_aval["nota_media_avaliacoes"].round(2)
+    ag_aval = pd.read_sql(sql_aval, dw)
     ag_ped = ag_ped.merge(ag_aval, on="cliente_sk", how="left")
 
     colunas_contrato = [
@@ -401,9 +223,39 @@ def monta_atributos_com_vazamento(dw):
     return ag_ped[colunas_contrato]
 
 
+def monta_atributos_corretos(dw):
+    return monta_atributos(dw, com_vazamento=False)
+
+
+def monta_atributos_com_vazamento(dw):
+    return monta_atributos(dw, com_vazamento=True)
+
+
 def grava(df, dw, sufixo):
     tabela = "recompra_90d" if sufixo == "correta" else "recompra_90d_vazamento"
-    df.to_sql(tabela, dw, schema="abt", if_exists="replace",
+    with dw.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS abt.{tabela} CASCADE;"))
+        conn.execute(text(f"""
+            CREATE TABLE abt.{tabela} (
+                cliente_sk BIGINT NOT NULL REFERENCES dw.dim_cliente (cliente_sk),
+                data_corte DATE NOT NULL,
+                alvo_recompra_90d SMALLINT NOT NULL CHECK (alvo_recompra_90d IN (0,1)),
+                recencia_dias INTEGER,
+                frequencia_pedidos INTEGER,
+                valor_monetario_total NUMERIC(14,4),
+                ticket_medio NUMERIC(14,4),
+                tempo_como_cliente_dias INTEGER,
+                taxa_cancelamento NUMERIC(6,4),
+                prazo_medio_entrega NUMERIC(6,2),
+                categorias_distintas INTEGER,
+                canal_predominante VARCHAR(50),
+                propensao_online NUMERIC(6,4),
+                qtd_atendimentos_sac INTEGER,
+                nota_media_avaliacoes NUMERIC(4,2),
+                PRIMARY KEY (cliente_sk, data_corte)
+            );
+        """))
+    df.to_sql(tabela, dw, schema="abt", if_exists="append",
               index=False, method="multi", chunksize=5_000)
     print(f"abt.{tabela}: {len(df)} linhas, {df.shape[1]} colunas")
 

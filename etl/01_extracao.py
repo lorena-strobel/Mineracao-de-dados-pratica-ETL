@@ -40,7 +40,7 @@ def grava_stg(df, tabela, engine, primeiro_bloco):
               index=False, method="multi", chunksize=5_000)
 
 
-def extrai_mysql(qa):
+def extrai_mysql():
     print("-> Extraindo MySQL...", flush=True)
     eng, dw = eng_mysql(), eng_dw()
     # TODO 1.1 — para cada tabela do legado, leia em blocos de LOTE linhas
@@ -58,7 +58,7 @@ def extrai_mysql(qa):
             primeiro_bloco = False
 
 
-def extrai_postgres(qa):
+def extrai_postgres():
     print("-> Extraindo PostgreSQL E-commerce...", flush=True)
     # TODO 1.2 — mesma ideia para shop.customer / product / orders / order_item.
     #            Atenção: placed_at e delivered_at são TIMESTAMPTZ.
@@ -78,7 +78,7 @@ def extrai_postgres(qa):
             primeiro_bloco = False
 
 
-def extrai_sac(qa):
+def extrai_sac():
     print("-> Extraindo CSV do SAC...", flush=True)
     # TODO 1.3 — leia o CSV do SAC.
     #   · encoding e separador: descubra no perfilamento, não chute;
@@ -93,7 +93,7 @@ def extrai_sac(qa):
         primeiro_bloco = False
 
 
-def extrai_avaliacoes(qa):
+def extrai_avaliacoes():
     print("-> Extraindo NDJSON de Avaliações...", flush=True)
     # TODO 1.4 — leia o NDJSON.
     #   · o esquema é irregular: chaves faltando NÃO são o mesmo que nulas;
@@ -120,10 +120,10 @@ def extrai_avaliacoes(qa):
 
 if __name__ == "__main__":
     qa = Suite(etapa="01_extracao")
-    extrai_mysql(qa)
-    extrai_postgres(qa)
-    extrai_sac(qa)
-    extrai_avaliacoes(qa)
+    extrai_mysql()
+    extrai_postgres()
+    extrai_sac()
+    extrai_avaliacoes()
 
     dw = eng_dw()
 

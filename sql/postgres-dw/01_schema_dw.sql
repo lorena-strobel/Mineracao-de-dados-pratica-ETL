@@ -161,16 +161,21 @@ CREATE TABLE IF NOT EXISTS dw.fato_avaliacao (
 -- ===========================================================================
 DROP TABLE IF EXISTS abt.recompra_90d CASCADE;
 CREATE TABLE abt.recompra_90d (
-  cliente_sk          BIGINT  NOT NULL REFERENCES dw.dim_cliente (cliente_sk),
-  data_corte          DATE    NOT NULL,
-  alvo_recompra_90d   SMALLINT NOT NULL CHECK (alvo_recompra_90d IN (0,1)),
-  -- ------------------------------------------------------------------
-  -- A PARTIR DAQUI: atributos preditivos desenhados por vocês.
-  -- Exemplos do que é legítimo (calculado somente até data_corte):
-  --   recencia_dias, frequencia_pedidos, valor_monetario_total,
-  --   ticket_medio, prazo_medio_entrega, qtd_atendimentos_sac,
-  --   nota_media_avaliacoes, categorias_distintas, canal_predominante
-  -- ------------------------------------------------------------------
+  cliente_sk              BIGINT  NOT NULL REFERENCES dw.dim_cliente (cliente_sk),
+  data_corte              DATE    NOT NULL,
+  alvo_recompra_90d       SMALLINT NOT NULL CHECK (alvo_recompra_90d IN (0,1)),
+  recencia_dias           INTEGER,
+  frequencia_pedidos      INTEGER,
+  valor_monetario_total   NUMERIC(14,4),
+  ticket_medio            NUMERIC(14,4),
+  tempo_como_cliente_dias INTEGER,
+  taxa_cancelamento       NUMERIC(6,4),
+  prazo_medio_entrega     NUMERIC(6,2),
+  categorias_distintas    INTEGER,
+  canal_predominante      VARCHAR(50),
+  propensao_online        NUMERIC(6,4),
+  qtd_atendimentos_sac    INTEGER,
+  nota_media_avaliacoes   NUMERIC(4,2),
   PRIMARY KEY (cliente_sk, data_corte)
 );
 

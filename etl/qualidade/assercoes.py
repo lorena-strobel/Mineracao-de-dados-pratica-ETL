@@ -94,12 +94,14 @@ class Suite:
 
     # -- persistência e relato ---------------------------------------------
     def registrar(self, engine):
+        sql_del = text("DELETE FROM qa.execucao_assercao WHERE etapa = :etapa")
         sql = text("""
             INSERT INTO qa.execucao_assercao
                 (etapa, nome, descricao, valor_obtido, valor_esperado, aprovado)
             VALUES (:etapa, :nome, :descricao, :valor, :esperado, :ok)
         """)
         with engine.begin() as cx:
+            cx.execute(sql_del, dict(etapa=self.etapa))
             for r in self.resultados:
                 cx.execute(sql, dict(etapa=self.etapa, nome=r.nome,
                                      descricao=r.descricao, valor=r.valor_obtido,

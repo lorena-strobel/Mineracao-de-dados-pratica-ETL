@@ -98,131 +98,100 @@ def carrega_dimensoes(qa):
 
 
 def carrega_fato_pedido(qa):
-    # TODO 3.2 — dw.fato_pedido.
-    #            Atenção especial às chaves: como mapear id_origem para as SKs?
-    #            E o que fazer com os pedidos que referenciam clientes que não
-    #            estão na dimensão (se houver)? Ver RDT-12.
-    #
-    # Dica RDT-12: o que significa, conceitualmente, um pedido cujo
-    #            ID_CLIENTE não existe em CLIENTES? Um cliente "DESCONHECIDO"
-    #            na dimensão é a solução clássica. Adote-a ou justifique outra.
-
-    print("-> Carregando dw.fato_pedido...")
+    print("-> Carregando dw.fato_pedido (via SQL nativo)...", flush=True)
     dw = eng_dw()
     
-    # Carrega pedidos da staging
-    df_pedidos = pd.read_sql("SELECT * FROM stg.pedidos_valores_conformados", dw)
-    
-    # Carrega as tabelas de dimensão
-    df_status = pd.read_sql("SELECT status_sk, status_origem, sistema FROM dw.dim_status", dw)
-    df_canal = pd.read_sql("SELECT canal_sk, canal_origem, sistema FROM dw.dim_canal", dw)
-    df_cliente = pd.read_sql("SELECT cliente_sk, id_legado, id_ecommerce FROM dw.dim_cliente", dw)
-    
-    # Cruzamento de Status e Canal (padronizando 'ECOMMERCE' para 'ECOM')
-    df_status["sistema_origem"] = df_status["sistema"].replace({"ECOMMERCE": "ECOM"})
-    df_canal["sistema_origem"] = df_canal["sistema"].replace({"ECOMMERCE": "ECOM"})
-    
-    df_pedidos = df_pedidos.merge(
-        df_status[["status_sk", "status_origem", "sistema_origem"]],
-        on=["status_origem", "sistema_origem"],
-        how="left"
-    )
-    df_pedidos = df_pedidos.merge(
-        df_canal[["canal_sk", "canal_origem", "sistema_origem"]],
-        on=["canal_origem", "sistema_origem"],
-        how="left"
-    )
-    
-    # Cruzamento de Cliente (Legado e E-commerce) via mapa direto
-    mapa_leg = df_cliente.dropna(subset=["id_legado"]).set_index(df_cliente["id_legado"].dropna().astype("int64"))["cliente_sk"]
-    mapa_ecom = df_cliente.dropna(subset=["id_ecommerce"]).set_index(df_cliente["id_ecommerce"].dropna().astype("int64"))["cliente_sk"]
-    
-    df_pedidos["cliente_sk"] = None
-    df_pedidos.loc[df_pedidos["sistema_origem"] == "LEGADO", "cliente_sk"] = df_pedidos["id_cliente_origem"].map(mapa_leg)
-    df_pedidos.loc[df_pedidos["sistema_origem"] == "ECOM", "cliente_sk"] = df_pedidos["id_cliente_origem"].map(mapa_ecom)
-    
-    # Cliente sentinela para pedidos sem cliente (RDT-12)
-    with dw.connect() as cx:
-        res = cx.execute(text("SELECT cliente_sk FROM dw.dim_cliente WHERE nome_padronizado = 'CLIENTE DESCONHECIDO'")).fetchone()
-        sk_desconhecido = res[0] if res else None
-        
-    if sk_desconhecido is not None:
-        df_pedidos["cliente_sk"] = df_pedidos["cliente_sk"].infer_objects(copy=False).fillna(sk_desconhecido).astype("int64")
-    else:
-        print("   [INFO] 'CLIENTE DESCONHECIDO' ainda não cadastrado em dw.dim_cliente (aguardando RDT-12 do colega).")
+    sql_carga = text("""
+        TRUNCATE dw.fato_pedido RESTART IDENTITY CASCADE;
 
-    # Formatação de datas e prazos de entrega
-    df_pedidos["data_pedido_sk"] = pd.to_datetime(df_pedidos["dt_pedido_conformada"]).dt.date
-    df_pedidos["data_entrega_sk"] = pd.to_datetime(df_pedidos["dt_entrega_conformada"]).dt.date
-    df_pedidos["dias_entrega"] = df_pedidos["dias_entrega"].round().astype("Int64")
-    
-    # Seleção das colunas exatas e gravação no DW
-    colunas_fato = [
-        "id_origem", "sistema_origem", "cliente_sk", "data_pedido_sk", 
-        "data_entrega_sk", "canal_sk", "status_sk", "qtd_itens", 
-        "valor_mercadoria", "valor_frete", "valor_desconto", "valor_total", "dias_entrega"
-    ]
-    df_fato = df_pedidos[colunas_fato]
-    
+        INSERT INTO dw.fato_pedido (
+            id_origem, sistema_origem, cliente_sk, data_pedido_sk, 
+            data_entrega_sk, canal_sk, status_sk, qtd_itens, 
+            valor_mercadoria, valor_frete, valor_desconto, valor_total, dias_entrega
+        )
+        SELECT 
+            p.id_origem,
+            p.sistema_origem,
+            COALESCE(
+                CASE 
+                    WHEN p.sistema_origem = 'LEGADO' THEN c_leg.cliente_sk
+                    WHEN p.sistema_origem = 'ECOM' THEN c_eco.cliente_sk
+                END,
+                -1
+            ) AS cliente_sk,
+            p.dt_pedido_conformada::date AS data_pedido_sk,
+            p.dt_entrega_conformada::date AS data_entrega_sk,
+            dc.canal_sk,
+            ds.status_sk,
+            p.qtd_itens,
+            p.valor_mercadoria,
+            p.valor_frete,
+            p.valor_desconto,
+            p.valor_total,
+            ROUND(p.dias_entrega)::int AS dias_entrega
+        FROM stg.pedidos_valores_conformados p
+        LEFT JOIN dw.dim_cliente c_leg ON p.sistema_origem = 'LEGADO' AND p.id_cliente_origem = c_leg.id_legado
+        LEFT JOIN dw.dim_cliente c_eco ON p.sistema_origem = 'ECOM' AND p.id_cliente_origem = c_eco.id_ecommerce
+        LEFT JOIN dw.dim_canal dc ON p.canal_origem = dc.canal_origem AND p.sistema_origem = dc.sistema
+        LEFT JOIN dw.dim_status ds ON p.status_origem = ds.status_origem AND p.sistema_origem = ds.sistema;
+    """)
+
     with dw.begin() as conn:
-        conn.execute(text("TRUNCATE dw.fato_pedido RESTART IDENTITY CASCADE;"))
-    
-    df_fato.to_sql("fato_pedido", dw, schema="dw", if_exists="append", index=False, chunksize=10_000)
-    print(f"-> fato_pedido carregada com sucesso: {len(df_fato)} pedidos.")
+        conn.execute(sql_carga)
+    print("-> fato_pedido carregada com sucesso.")
 
 
 def carrega_fato_item(qa):
-    """TODO 3.3 (Lorena / RDT-10) — Tratamento e carga dos itens órfãos."""
-    print("-> Carregando dw.fato_item_pedido (RDT-10)...", flush=True)
+    """Carga de dw.fato_item_pedido com descarte de órfãos (RDT-10) via SQL nativo."""
+    print("-> Carregando dw.fato_item_pedido (RDT-10 via SQL nativo)...", flush=True)
     dw = eng_dw()
 
-    # 1. Carrega dados da staging e do DW
-    df_itens = pd.read_sql("SELECT * FROM stg.itens_valores_conformados", dw)
-    df_pedidos_dw = pd.read_sql("SELECT pedido_sk, id_origem, sistema_origem FROM dw.fato_pedido", dw)
-    df_produtos_dw = pd.read_sql("SELECT produto_sk, id_legado, id_ecommerce, origem FROM dw.dim_produto", dw)
+    with dw.connect() as conn:
+        tot_bruto = int(conn.execute(text("SELECT COUNT(*) FROM stg.itens_valores_conformados")).scalar())
 
-    # 2. Cruza itens com pedidos para identificar o pedido_sk
-    df_itens = df_itens.merge(
-        df_pedidos_dw[["pedido_sk", "id_origem", "sistema_origem"]],
-        left_on=["id_pedido_origem", "sistema_origem"],
-        right_on=["id_origem", "sistema_origem"],
-        how="left"
-    )
+    sql_carga = text("""
+        TRUNCATE dw.fato_item_pedido RESTART IDENTITY CASCADE;
 
-    # 3. Descarta os itens órfãos (conforme RDT-10)
-    total_itens_original = len(df_itens)
-    df_validos = df_itens[df_itens["pedido_sk"].notna()].copy()
-    itens_orfaos = total_itens_original - len(df_validos)
-    taxa_orfaos = (itens_orfaos / total_itens_original) * 100
-    print(f"   Itens válidos: {len(df_validos)}")
-    print(f"   Itens órfãos descartados: {itens_orfaos} ({taxa_orfaos:.2f}%)")
-
-    # 4. Cruza produtos para identificar o produto_sk
-    mapa_prod_leg = df_produtos_dw.dropna(subset=["id_legado"]).set_index(df_produtos_dw["id_legado"].dropna().astype("int64"))["produto_sk"]
-    mapa_prod_ecom = df_produtos_dw.dropna(subset=["id_ecommerce"]).set_index(df_produtos_dw["id_ecommerce"].dropna().astype("int64"))["produto_sk"]
-
-    df_validos["produto_sk"] = None
-    df_validos.loc[df_validos["sistema_origem"] == "LEGADO", "produto_sk"] = df_validos["id_produto_origem"].map(mapa_prod_leg)
-    df_validos.loc[df_validos["sistema_origem"] == "ECOM", "produto_sk"] = df_validos["id_produto_origem"].map(mapa_prod_ecom)
-
-    # 5. Grava no DW
-    colunas_item = ["pedido_sk", "produto_sk", "quantidade", "valor_unitario", "valor_desconto", "valor_linha"]
-    df_fato_item = df_validos[colunas_item]
+        INSERT INTO dw.fato_item_pedido (
+            pedido_sk, produto_sk, quantidade, valor_unitario, valor_desconto, valor_linha
+        )
+        SELECT 
+            fp.pedido_sk,
+            dp.produto_sk,
+            i.quantidade,
+            i.valor_unitario,
+            i.valor_desconto,
+            i.valor_linha
+        FROM stg.itens_valores_conformados i
+        JOIN dw.fato_pedido fp 
+            ON fp.id_origem = i.id_pedido_origem 
+           AND fp.sistema_origem = i.sistema_origem
+        JOIN dw.dim_produto dp 
+            ON (i.sistema_origem = 'LEGADO' AND dp.id_legado = i.id_produto_origem)
+            OR (i.sistema_origem = 'ECOM' AND dp.id_ecommerce = i.id_produto_origem);
+    """)
 
     with dw.begin() as conn:
-        conn.execute(text("TRUNCATE dw.fato_item_pedido RESTART IDENTITY CASCADE;"))
-    df_fato_item.to_sql("fato_item_pedido", dw, schema="dw", if_exists="append", index=False, chunksize=10_000)
-    print(f"-> fato_item_pedido carregada com sucesso: {len(df_fato_item)} itens.", flush=True)
+        conn.execute(sql_carga)
 
-    # 6. Asserções de qualidade da RDT-10
-    qa.igual("total itens carregados fato_item_pedido", len(df_fato_item), 1371876,
+    with dw.connect() as conn:
+        tot_carregados = int(conn.execute(text("SELECT COUNT(*) FROM dw.fato_item_pedido")).scalar())
+        nulos_ped = int(conn.execute(text("SELECT COUNT(*) FROM dw.fato_item_pedido WHERE pedido_sk IS NULL")).scalar())
+        nulos_prod = int(conn.execute(text("SELECT COUNT(*) FROM dw.fato_item_pedido WHERE produto_sk IS NULL")).scalar())
+
+    itens_orfaos = tot_bruto - tot_carregados
+    taxa_orfaos = (itens_orfaos / tot_bruto) * 100 if tot_bruto else 0
+    print(f"   Itens válidos: {tot_carregados}")
+    print(f"   Itens órfãos descartados: {itens_orfaos} ({taxa_orfaos:.2f}%)")
+
+    qa.igual("total itens carregados fato_item_pedido", tot_carregados, 1371876,
              "1.371.876 itens vinculados a pedidos existentes carregados")
     qa.igual("total itens orfaos descartados rdt10", itens_orfaos, 20577,
              "Exatamente 20.577 itens órfãos descartados conforme RDT-10")
-    qa.sem_nulos("pedido_sk sem nulos em fato_item_pedido", df_fato_item["pedido_sk"],
-                 "Nenhum item pode ter pedido_sk nulo")
-    qa.sem_nulos("produto_sk sem nulos em fato_item_pedido", df_fato_item["produto_sk"],
-                 "Nenhum item pode ter produto_sk nulo")
+    qa.igual("pedido_sk sem nulos em fato_item_pedido", nulos_ped, 0,
+             "Nenhum item pode ter pedido_sk nulo")
+    qa.igual("produto_sk sem nulos em fato_item_pedido", nulos_prod, 0,
+             "Nenhum item pode ter produto_sk nulo")
 
 
 def carrega_fatos_auxiliares(qa):
@@ -310,8 +279,8 @@ def carrega_fatos_auxiliares(qa):
                 SUBSTRING(a.submitted_at FROM 1 FOR 10)::date AS data_sk,
                 ROUND(NULLIF(TRIM(a.rating), '')::numeric)::int AS nota,
                 CASE 
-                    WHEN a.verified_purchase = 1 THEN TRUE 
-                    WHEN a.verified_purchase = 0 THEN FALSE 
+                    WHEN a.verified_purchase::text IN ('1', 'true', 'True', 't') THEN TRUE 
+                    WHEN a.verified_purchase::text IN ('0', 'false', 'False', 'f') THEN FALSE 
                     ELSE NULL 
                 END AS compra_verificada,
                 ROUND(a.helpful_votes)::int AS votos_uteis
@@ -327,8 +296,8 @@ def carrega_fatos_auxiliares(qa):
                 SUBSTRING(a.submitted_at FROM 1 FOR 10)::date AS data_sk,
                 ROUND(NULLIF(TRIM(a.rating), '')::numeric)::int AS nota,
                 CASE 
-                    WHEN a.verified_purchase = 1 THEN TRUE 
-                    WHEN a.verified_purchase = 0 THEN FALSE 
+                    WHEN a.verified_purchase::text IN ('1', 'true', 'True', 't') THEN TRUE 
+                    WHEN a.verified_purchase::text IN ('0', 'false', 'False', 'f') THEN FALSE 
                     ELSE NULL 
                 END AS compra_verificada,
                 ROUND(a.helpful_votes)::int AS votos_uteis
