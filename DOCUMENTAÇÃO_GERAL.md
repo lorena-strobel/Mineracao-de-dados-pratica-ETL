@@ -4,8 +4,7 @@
 **Instituição:** Instituto Federal de Educação, Ciência e Tecnologia de Mato Grosso (IFMT)  
 **Disciplina:** Mineração de Dados (Semestre 2026/2)  
 **Docente Responsável:** Prof. Dr. Orlando Júnior  
-**Stack Tecnológica:** Docker Compose, PostgreSQL 16 (DW e E-commerce), MySQL 8.0 (Legado), Python 3.12 (Pandas, SQLAlchemy), Orange Data Mining 3.40  
-**Fichas Completas dos RDTs:** [docs/MODELO_RDT_preenchido.md](file:///home/spacery/Documents/[CodeRoot]/IFMT/Mineração de Dados/Mineracao-de-dados-pratica-ETL/docs/MODELO_RDT_preenchido.md)
+**Stack Tecnológica:** Docker Compose, PostgreSQL 16 (DW e E-commerce), MySQL 8.0 (Legado), Python 3.12 (Pandas, SQLAlchemy), Orange Data Mining 3.40
 
 ---
 
@@ -14,8 +13,7 @@
 * **O Problema:** A Mercatto Varejo uniu suas lojas físicas (MySQL antigo) com seu e-commerce (PostgreSQL), além de planilhas do SAC (CSV) e avaliações de clientes (NDJSON). Os sistemas usavam formatos, moedas contábeis e regras de cancelamento incompatíveis.
 * **O Volume:** **2,2 milhões de linhas** processadas em lotes (`ESCALA=1.0`), resultando em **106.937 clientes unificados**, **410.000 pedidos** e **1.371.876 itens de pedido** no Data Warehouse.
 * **A Qualidade:** **127 verificações automáticas (`qa.assercoes`)** monitoram todas as etapas com **100% de aprovação** e desvio financeiro de **0,00%** em relação às origens.
-* **A Descoberta no Orange (Semana 4):** Em uma base de **99.749 clientes reais** (taxa de recompra de **21,77%**), provamos como um erro de vazamento de dados faz modelos comuns saltarem de uma AUC realista (**0,50–0,54**) para uma precisão ilusória (**0,80–0,89** e **90,2% de acurácia**) que falharia em produção.
-* **A Performance:** O pipeline completo roda do zero em **2 minutos e 50 segundos** via Docker.
+
 
 ### Sumário Navegável
 1. [Visão Geral e Arquitetura de Dados](#1-visão-geral-e-arquitetura-de-dados)
@@ -38,7 +36,7 @@ A rede Mercatto Varejo opera com quatro fontes que nasceram em épocas e tecnolo
 1. **Loja Física (Legado — MySQL 8.0):** Sistema dos anos 2000 em codificação `latin1`, tabelas em caixa alta (`CLIENTES`, `PEDIDOS`, `ITENS_PEDIDO`, `PRODUTOS`), categorias em texto livre e uso de números negativos ou datas em `1900-01-01` para indicar ausência de valor.
 2. **Loja Virtual (E-commerce — PostgreSQL 16):** Sistema moderno em `UTF-8` (`shop.customer`, `orders`, `order_item`, `product`, `category`), com datas em fuso horário (`TIMESTAMPTZ`) e categorias organizadas em árvore.
 3. **Chamados do SAC (CSV):** Arquivo `atendimentos_sac.csv` separado por `;`, codificado em `latin1`, contendo quebras de linha dentro dos textos de reclamação.
-4. **Avaliações de Produtos (NDJSON):** Arquivo `avaliacoes.ndjson` onde cada linha é um JSON independente, com notas ora escritas como número (`5`), ora como texto (`"5"`), e produtos físicos mascarados como `LEG-{id}`.
+4. **Avaliações de Produtos (NDJSON):** Arquivo `avaliacoes.ndjson` onde cada linha é um JSON independente, com notas escritas como número (`5`), ou como texto (`"5"`).
 
 ---
 
@@ -76,22 +74,6 @@ flowchart TD
 
 ---
 
-### 1.3. Os Sete Princípios do Projeto
-Todas as decisões técnicas seguem os sete princípios definidos na disciplina:
-
-1. **Três Níveis de Heterogeneidade:**
-   * *Sintática (formato):* Diferenças de acentuação (`latin1` vs. `UTF-8`) e arquivos (SQL, CSV, JSON). Resolve-se com configuração de leitura.
-   * *Estrutural (esquema):* Tabelas e chaves diferentes entre sistemas. Resolve-se com modelagem no banco.
-   * *Semântica (significado):* O mesmo nome de coluna querendo dizer coisas diferentes nas duas lojas (como o frete dentro do valor total). Ferramentas automáticas não detectam isso; exige decisão humana documentada.
-2. **Volume que Impede Ajuste Manual:** Com 2,2 milhões de linhas, nenhum erro pode ser corrigido editando IDs na mão. Toda regra é programada para rodar em lotes (`chunksize=50.000`).
-3. **Declaração de Perda (RDT):** Toda escolha técnica abre mão de alguma informação. Cada RDT declara o que o dado mostrava, o que decidimos e o que perdemos com a decisão.
-4. **Reprodutibilidade por Contêiner:** Qualquer pessoa reconstrói o banco e os resultados do zero apenas com Docker Compose.
-5. **Grão Declarado Antes da Carga:** Toda tabela-fato ou analítica começa definindo exatamente o que uma linha representa, no formato de Ralph Kimball.
-6. **Qualidade Contínua (`qa.assercoes`):** Cada etapa testa seus próprios resultados antes de passar adiante, gravando 127 verificações na tabela `qa.execucao_assercao`.
-7. **Corte Temporal Estrito (`30/06/2025 23:59:59 UTC`):** Nenhum dado ocorrido após essa data entra nos atributos preditivos da ABT correta.
-
----
-
 ## 2. ETAPA 1: EXTRAÇÃO BRUTA E ÁREA DE STAGING (`01_extracao.py` & RDT-01)
 
 ### 2.1. Para que serve a Área de Staging (`stg`)?
@@ -103,23 +85,18 @@ O schema `stg` no PostgreSQL guarda uma cópia bruta das quatro fontes, sem corr
 * **O que abrimos mão (perda):** Renunciamos à velocidade de uma carga incremental (que leria apenas linhas novas em poucos segundos) em troca da certeza de que o ambiente é 100% idêntico e sem sobras de execuções passadas.
 * **Números e validação (`4 asserções OK`):** `130.000` pedidos do legado, `280.000` pedidos do e-commerce, `96.140` linhas do SAC (0 protocolos nulos) e `160.000` avaliações únicas.
 
-### 2.3. Cuidados Sintáticos na Leitura
-* **Acentuação (`latin1` -> `UTF-8`):** Conexão do MySQL e leitura do CSV configuradas em `latin1`, evitando nomes corrompidos (*mojibake*).
-* **Quebras de linha no SAC:** Leitura em blocos pelo parser do Pandas (`dtype=str`, `sep=';'`), que preserva comentários com várias linhas dentro do mesmo chamado sem quebrar colunas.
-* **JSON irregular:** Desaninhamento explícito dos campos `order_ref` e `product_sku` linha a linha, mantendo campos ausentes como `NULL`.
-
 ---
 
 ## 3. ETAPA 2: TRANSFORMAÇÃO E SANEAMENTO (`02_transformacao.py` & RDT-02 A RDT-09)
 
-A Etapa 2 limpa as anomalias e alinha os conceitos entre a loja física e a virtual, validando **51 asserções**. Os detalhes completos de cada ficha estão em [docs/MODELO_RDT_preenchido.md](file:///home/spacery/Documents/[CodeRoot]/IFMT/Mineração de Dados/Mineracao-de-dados-pratica-ETL/docs/MODELO_RDT_preenchido.md).
+A Etapa 2 limpa as anomalias e alinha os conceitos entre a loja física e a virtual, validando **51 asserções**.
 
 ### 3.1. RDT-02: Unificação de Clientes e a Armadilha do CPF Inválido
 * **O que encontramos nos dados:** Cerca de 9% dos CPFs tinham dígito verificador matematicamente inválido, mas **1.135 clientes** cometeram exatamente o mesmo erro de digitação ao se cadastrarem na loja física e no site. Além disso, ~8% dos cadastros não tinham CPF.
 * **O que fizemos:** Unificamos os clientes pelo CPF limpo de 11 dígitos **mesmo quando o dígito verificador era inválido** (marcando `cpf_valido = False` e `regra_pareamento = 'CPF_DIGITO_INVALIDO'`), pois um documento com erro repetido nas duas pontas identifica a mesma pessoa com segurança. Resultou em **106.937 clientes únicos** em `dw.dim_cliente` (**12.605** comprando em `AMBOS` os canais: `11.470` válidos e `1.135` com erro de dígito).
-* **O que abrimos mão (perda):** Não unificamos clientes sem CPF por nome + cidade + UF (homônimos como "Maria Silva" geravam mais de 38% de falsos positivos) e descartamos os cadastros sem CPF da dimensão (tratando suas compras pelo cliente sentinela no RDT-12).
+* **O que abrimos mão (perda):** Não unificamos clientes sem CPF por nome + cidade + UF e descartamos os cadastros sem CPF da dimensão.
 
-### 3.2. RDT-03: Deduplicação Interna de Clientes no Legado
+### 3.2. RDT-03: Deduplicação Interna de Clientes no DB Legado
 * **O que encontramos nos dados:** A tabela `CLIENTES` do legado tinha `47.250` linhas para apenas `41.400` CPFs únicos — um excesso de **5.849 cadastros duplicados** (12,38%) gerados por recadastros em loja e diferenças de máscara.
 * **O que fizemos:** Ordenamos os cadastros do mais recente para o mais antigo (`dt_cadastro DESC`) e mantivemos o registro mais atual de cada CPF (*Golden Record*).
 * **O que abrimos mão (perda):** Perdemos o histórico de endereços e telefones antigos das **5.849 fichas descartadas**, além do vínculo direto dos pedidos que apontavam para o `ID_CLIENTE` antigo.
@@ -152,7 +129,7 @@ A Etapa 2 limpa as anomalias e alinha os conceitos entre a loja física e a virt
 * **O que abrimos mão (perda):** Esses 3.483 pedidos deixam de participar do cálculo de prazo médio de entrega dos clientes.
 
 ### 3.8. RDT-09: Padronização de Fuso Horário em UTC
-* **O que encontramos nos dados:** O e-commerce gravava data e hora com fuso (`TIMESTAMPTZ`), enquanto o legado gravava apenas a data seca (`DATE`), criando risco de incluir ou excluir pedidos errados na virada do corte (`30/06/2025 23:59:59`).
+* **O que encontramos nos dados:** O e-commerce gravava data e hora com fuso (`TIMESTAMPTZ`), enquanto o legado gravava apenas a data seca (`DATETIME`) sem fuso-horário, criando risco de incluir ou excluir pedidos errados na virada do corte (`30/06/2025 23:59:59`).
 * **O que fizemos:** Padronizamos todos os **410.000 pedidos** em UTC (`TIMESTAMPTZ`), fixando meia-noite UTC para as datas do legado. Isso separou com precisão **341.546 pedidos** até a data de corte e **68.454 pedidos** após o corte.
 * **O que abrimos mão (perda):** No legado, perdemos a hora exata do dia em que a compra ocorreu na loja física.
 
@@ -223,20 +200,19 @@ Avaliamos **Naive Bayes**, **Árvore de Decisão** e **Regressão Logística** c
 
 | Algoritmo | Métrica | ABT Correta (Sem Vazamento) | ABT com Vazamento | Salto Ilusório (Delta) |
 | :--- | :--- | :---: | :---: | :---: |
-| **Naive Bayes** | **AUC-ROC** | **0,5367** | **0,8888** | **+0,3521** |
+| **Naive Bayes** | **Área sob a Curva ROC** | **0,5367** | **0,8888** | **+0,3521** |
 | | Acurácia (CA) | 0,7811 | 0,8074 | +0,0263 |
 | | F1-Score | 0,6907 | 0,8077 | +0,1170 |
-| **Árvore de Decisão** | **AUC-ROC** | **0,5045** | **0,8796** | **+0,3751** |
+| **Árvore de Decisão** | **Área sob a Curva ROC** | **0,5045** | **0,8796** | **+0,3751** |
 | | Acurácia (CA) | 0,7026 | **0,9024** | **+0,1998** |
 | | F1-Score | 0,6989 | 0,9025 | +0,2036 |
-| **Regressão Logística** | **AUC-ROC** | **0,5137** | **0,8033** | **+0,2896** |
+| **Regressão Logística** | **Área sob a Curva ROC** | **0,5137** | **0,8033** | **+0,2896** |
 | | Acurácia (CA) | 0,7823 | 0,7601 | -0,0222 |
 | | F1-Score | 0,6870 | 0,7619 | +0,0749 |
 
-### 6.2. Como Interpretar Esses Números na Apresentação
+### 6.2. Interprendo Esses Números
 * **Por que a ABT Correta tem AUC ~0,50–0,54?** Porque no varejo real, saber apenas quanto e quando a pessoa comprou no passado não adivinha sozinho se ela terá uma necessidade imediata nos próximos 90 dias. Esse resultado modesto é o comportamento honesto do dado real.
 * **Por que a ABT Vazada chega a 0,89 de AUC e 90,2% de acurácia?** Porque a Árvore de Decisão olha para `recencia_dias < 0` no topo da árvore e descobre quem comprou depois de 30/06. É uma "cola" do futuro: no dia em que esse modelo for para produção, ninguém terá recência negativa e o modelo errará tudo.
-* **Como desmascarar um modelo vazado sem ter a base correta?** (1) Olhando o topo da Árvore ou o *Rank* de atributos (uma única variável concentra quase todo o ganho); (2) checando a tabela de dados (recências negativas impossíveis); e (3) conferindo o código SQL em busca do filtro `<= data_corte`.
 
 ---
 
@@ -272,9 +248,7 @@ ORDER BY etapa;
 
 ---
 
-## 8. GUIA RÁPIDO DE RESPOSTAS PARA A APRESENTAÇÃO (FAQ)
-
-Respostas curtas e diretas, prontas para usar caso o professor pergunte na arguição:
+## 8. FAQ
 
 * **Q1: Por que vocês não unificaram os clientes sem CPF usando Nome + Cidade + UF?**  
   **R:** Porque testamos na base e nomes comuns ("Maria Silva", "João Santos") na mesma cidade geravam mais de 38% de falsos positivos. Fundir duas pessoas diferentes na mesma conta corrompe o histórico de compras; preferimos unificar apenas quem tinha CPF e declarar a perda no RDT-02.

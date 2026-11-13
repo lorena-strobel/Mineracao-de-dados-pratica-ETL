@@ -53,7 +53,7 @@ def normaliza_nome(nome):
 
 
 # ===========================================================================
-# DECISÃO 1 — IDENTIDADE DO CLIENTE ENTRE OS DOIS SISTEMAS
+# DECISÃO 1 — IDENTIDADE DO CLIENTE ENTRE OS DOIS SISTEMAS (RDT-02 e RDT-03)
 # ===========================================================================
 def unifica_clientes(qa):
     """
@@ -252,7 +252,7 @@ def unifica_clientes(qa):
     print(f"-> Duplicatas internas removidas no legado: {duplicatas_legado}")
 
 # ===========================================================================
-# DECISÃO 2 — CONFORMAÇÃO DE STATUS
+# DECISÃO 2 — CONFORMAÇÃO DE STATUS (RDT-04)
 # ===========================================================================
 def conforma_status(qa):
     """
@@ -326,7 +326,7 @@ def conforma_status(qa):
 
 
 # ===========================================================================
-# DECISÃO 3 — SEMÂNTICA DOS VALORES MONETÁRIOS
+# DECISÃO 3 — SEMÂNTICA DOS VALORES MONETÁRIOS (RDT-05 e RDT-06)
 # ===========================================================================
 def conforma_valores(qa):
     print("-> Conformando semântica de valores monetários (Decisão 3 / RDT-05 & RDT-06)...", flush=True)
@@ -508,7 +508,7 @@ def conforma_valores(qa):
 
 
 # ===========================================================================
-# DECISÃO 4 — TAXONOMIA DE PRODUTO
+# DECISÃO 4 — TAXONOMIA DE PRODUTO (RDT-07)
 # ===========================================================================
 def conforma_categorias(qa):
     print("-> Conformando taxonomia de categorias de produto (Decisão 4 / RDT-07)...", flush=True)
@@ -655,7 +655,7 @@ def conforma_categorias(qa):
 
 
 # ===========================================================================
-# DECISÃO 5 — DATAS, AUSÊNCIAS E SENTINELAS
+# DECISÃO 5 — DATAS, AUSÊNCIAS E SENTINELAS (RDT-08 e RDT-09)
 # ===========================================================================
 def trata_datas_e_ausencias(qa):
     print("-> Tratando datas, ausências, sentinelas e fuso horário UTC (Decisão 5 / RDT-08 & RDT-09)...", flush=True)
