@@ -20,7 +20,9 @@ Decisão obrigatória a registrar no RDT antes de codificar:
     docker compose exec etl python 01_extracao.py
 """
 
+import csv
 from datetime import datetime, timezone
+import io
 
 import pandas as pd
 from sqlalchemy import text
@@ -32,12 +34,33 @@ AGORA = datetime.now(timezone.utc)
 LOTE = 50_000          # leia em blocos: a base não cabe confortavelmente na RAM
 
 
+def psql_insert_copy(table, conn, keys, data_iter):
+    """Carga acelerada via PostgreSQL COPY mantendo fidelidade de nulos e strings vazias."""
+    dbapi_conn = conn.connection
+    with dbapi_conn.cursor() as cur:
+        s_buf = io.StringIO()
+        writer = csv.writer(s_buf, delimiter=",", quoting=csv.QUOTE_MINIMAL)
+        for row in data_iter:
+            writer.writerow([('\\N' if v is None else v) for v in row])
+        s_buf.seek(0)
+        columns = ", ".join([f'"{k}"' for k in keys])
+        table_name = f'"{table.schema}"."{table.name}"' if table.schema else f'"{table.name}"'
+        sql = f"COPY {table_name} ({columns}) FROM STDIN WITH (FORMAT csv, NULL '\\N')"
+        cur.copy_expert(sql=sql, file=s_buf)
+
+
 def grava_stg(df, tabela, engine, primeiro_bloco):
     df["_fonte"] = tabela.split("_")[0]
     df["_extraido_em"] = AGORA
-    df.to_sql(tabela, engine, schema="stg",
-              if_exists="replace" if primeiro_bloco else "append",
-              index=False, method="multi", chunksize=5_000)
+    # Preserva método multi no cadastro legado para garantir determinismo exato de desempate
+    if tabela == "legado_clientes":
+        df.to_sql(tabela, engine, schema="stg",
+                  if_exists="replace" if primeiro_bloco else "append",
+                  index=False, method="multi", chunksize=5_000)
+    else:
+        df.to_sql(tabela, engine, schema="stg",
+                  if_exists="replace" if primeiro_bloco else "append",
+                  index=False, method=psql_insert_copy, chunksize=50_000)
 
 
 def extrai_mysql():

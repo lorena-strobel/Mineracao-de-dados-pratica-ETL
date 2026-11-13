@@ -157,7 +157,7 @@ def carrega_fato_item(qa):
         )
         SELECT 
             fp.pedido_sk,
-            dp.produto_sk,
+            COALESCE(dp_leg.produto_sk, dp_eco.produto_sk) AS produto_sk,
             i.quantidade,
             i.valor_unitario,
             i.valor_desconto,
@@ -166,9 +166,11 @@ def carrega_fato_item(qa):
         JOIN dw.fato_pedido fp 
             ON fp.id_origem = i.id_pedido_origem 
            AND fp.sistema_origem = i.sistema_origem
-        JOIN dw.dim_produto dp 
-            ON (i.sistema_origem = 'LEGADO' AND dp.id_legado = i.id_produto_origem)
-            OR (i.sistema_origem = 'ECOM' AND dp.id_ecommerce = i.id_produto_origem);
+        LEFT JOIN dw.dim_produto dp_leg 
+            ON i.sistema_origem = 'LEGADO' AND dp_leg.id_legado = i.id_produto_origem
+        LEFT JOIN dw.dim_produto dp_eco 
+            ON i.sistema_origem = 'ECOM' AND dp_eco.id_ecommerce = i.id_produto_origem
+        WHERE COALESCE(dp_leg.produto_sk, dp_eco.produto_sk) IS NOT NULL;
     """)
 
     with dw.begin() as conn:
@@ -407,29 +409,44 @@ if __name__ == "__main__":
     #     (reconciliação financeira: é assim que se prova que a carga não mentiu);
     #   · nenhum pedido com dias_entrega negativo depois do tratamento.
 
-    df_fato = pd.read_sql("SELECT * FROM dw.fato_pedido", dw)
-    df_stg = pd.read_sql("SELECT sistema_origem, valor_total FROM stg.pedidos_valores_conformados", dw)
+    res = pd.read_sql("""
+        SELECT 
+            COUNT(*) as total_pedidos,
+            COUNT(*) - COUNT(cliente_sk) as nulos_cliente,
+            SUM(CASE WHEN cliente_sk = -1 THEN 1 ELSE 0 END) as sentinela,
+            COUNT(*) - COUNT(data_pedido_sk) as nulos_data,
+            COUNT(*) - COUNT(canal_sk) as nulos_canal,
+            COUNT(*) - COUNT(status_sk) as nulos_status,
+            MIN(dias_entrega) as menor_prazo,
+            SUM(CASE WHEN sistema_origem = 'LEGADO' THEN valor_total ELSE 0 END) as soma_dw_leg,
+            SUM(CASE WHEN sistema_origem = 'ECOM' THEN valor_total ELSE 0 END) as soma_dw_ecom
+        FROM dw.fato_pedido;
+    """, dw).iloc[0]
 
-    # Contagem do Grão (len do DataFrame)
-    qa.igual("contagem fato_pedido", len(df_fato), 410_000, "Exatamente 410.000 pedidos carregados")
+    stg_res = pd.read_sql("""
+        SELECT 
+            SUM(CASE WHEN sistema_origem = 'LEGADO' THEN valor_total ELSE 0 END) as soma_stg_leg,
+            SUM(CASE WHEN sistema_origem = 'ECOM' THEN valor_total ELSE 0 END) as soma_stg_ecom
+        FROM stg.pedidos_valores_conformados;
+    """, dw).iloc[0]
 
-    # Nenhuma FK órfã / nula (usando qa.sem_nulos nativo com Series do Pandas)
-    qa.sem_nulos("cliente_sk sem nulos", df_fato["cliente_sk"])
-    qa.igual("pedidos cliente desconhecido consolidado", int((df_fato["cliente_sk"] == -1).sum()), 38_699, "Total sentinela deve ser 38.699 (RDT-12)")
-    qa.sem_nulos("data_pedido_sk sem nulos", df_fato["data_pedido_sk"])
-    qa.sem_nulos("canal_sk sem nulos", df_fato["canal_sk"])
-    qa.sem_nulos("status_sk sem nulos", df_fato["status_sk"])
+    # Contagem do Grão
+    qa.igual("contagem fato_pedido", int(res["total_pedidos"]), 410_000, "Exatamente 410.000 pedidos carregados")
 
-    # Reconciliação Financeira (groupby e sum direto no Pandas)
-    soma_dw = df_fato.groupby("sistema_origem")["valor_total"].sum()
-    soma_stg = df_stg.groupby("sistema_origem")["valor_total"].sum()
-    desvio_leg = abs(soma_dw["LEGADO"] - soma_stg["LEGADO"]) / soma_stg["LEGADO"] * 100
-    desvio_ecom = abs(soma_dw["ECOM"] - soma_stg["ECOM"]) / soma_stg["ECOM"] * 100
+    # Nenhuma FK órfã / nula
+    qa.sem_nulos("cliente_sk sem nulos", pd.Series([None] * int(res["nulos_cliente"])))
+    qa.igual("pedidos cliente desconhecido consolidado", int(res["sentinela"]), 38_699, "Total sentinela deve ser 38.699 (RDT-12)")
+    qa.sem_nulos("data_pedido_sk sem nulos", pd.Series([None] * int(res["nulos_data"])))
+    qa.sem_nulos("canal_sk sem nulos", pd.Series([None] * int(res["nulos_canal"])))
+    qa.sem_nulos("status_sk sem nulos", pd.Series([None] * int(res["nulos_status"])))
+
+    # Reconciliação Financeira
+    desvio_leg = abs(res["soma_dw_leg"] - stg_res["soma_stg_leg"]) / stg_res["soma_stg_leg"] * 100
+    desvio_ecom = abs(res["soma_dw_ecom"] - stg_res["soma_stg_ecom"]) / stg_res["soma_stg_ecom"] * 100
     qa.entre("reconciliacao legado", float(desvio_leg), 0.0, 0.1, "desvio <= 0,1%")
     qa.entre("reconciliacao ecom", float(desvio_ecom), 0.0, 0.1, "desvio <= 0,1%")
 
-    # Prazos de entrega válidos (dropna e min no Pandas)
-    menor_prazo = df_fato["dias_entrega"].dropna().min()
-    qa.maior_igual("menor dias_entrega", float(menor_prazo), 0.0, "nenhum prazo de entrega negativo")
+    # Prazos de entrega válidos
+    qa.maior_igual("menor dias_entrega", float(res["menor_prazo"]), 0.0, "nenhum prazo de entrega negativo")
     qa.registrar(dw)
     qa.imprimir()
